@@ -5,55 +5,44 @@ An automated, high-precision GUI suite designed for the acquisition and synchron
 ## 📊 Dataset Status: Milestone 09 (March 12, 2026)
 
 * **Total Records**: 6,800+ image pairs (Clear/Blur).
-* 
-**Species Diversity**: 31 initial wood species expanded to 35, including Tualang, Merbau, and Giam.
+* **Species Diversity**: Expanded wood species to 35, including Tualang, Merbau, and Giam.
 
 
 * **Botanical Mapping**: Full integration of Scientific Names (e.g., *Koompassia excelsa*) within the SQLite registry.
-* 
-**Storage Structure**: Semi-Flat directory logic (`Kayu/Species/BlockID/clear/`) optimized for PyTorch `ImageFolder` loaders.
+* **Storage Structure**: Semi-Flat directory logic (`Kayu/Species/BlockID/clear/`) optimized for PyTorch `ImageFolder` loaders.
 
 
 
 ## 🛠️ Technical Stack
 
-* 
-**Language**: Python 3.14.
+* **Language**: Python 3.14.
 
 
-* 
-**GUI Framework**: PyQt6 for a multi-threaded, lag-free interface.
+* **GUI Framework**: PyQt6 for a multi-threaded, lag-free interface.
 
 
-* 
-**Computer Vision**: OpenCV 4.13 utilizing the Variance of Laplacian (VOL) for real-time sharpness quantification.
+* **Computer Vision**: OpenCV 4.13 utilizing the Variance of Laplacian (VOL) for real-time sharpness quantification.
 
 
-* 
-**Database**: SQLite3 for metadata tracking and relational species mapping.
+* **Database**: SQLite3 for metadata tracking and relational species mapping.
 
 
-* 
-**Hardware**: USB Microscope integrated with an Intel i7-10750H + GTX 1660 Ti environment.
+* **Hardware**: USB Microscope integrated with an Intel i7-10750H + GTX 1660 Ti environment.
 
 
 
 ## ✨ Key Features
 
-* 
-**Real-time VOL Metrics**: Quantifies image sharpness (High VOL > 1000 = Clear; Single digits = Synthetic Blur) to ensure training data quality.
+* **Real-time VOL Metrics**: Quantifies image sharpness (High VOL > 1000 = Clear; Single digits = Synthetic Blur) to ensure training data quality.
 
 
-* 
-**Automated Dataset Repair**: Built-in scripts for filename padding (e.g., BAL3 → BAL03) and database-to-disk synchronization.
+* **Automated Dataset Repair**: Built-in scripts for filename padding (e.g., BAL3 → BAL03) and database-to-disk synchronization.
 
 
-* 
-**Species Management**: Dynamic registry for initials-to-name mapping with a safety lock to prevent folder misrouting.
+* **Species Management**: Dynamic registry for initials-to-name mapping with a safety lock to prevent folder misrouting.
 
 
-* 
-**Integrity Verification**: Automated "Verify Dataset" tool to cross-reference 6,800+ SQL paths against local physical storage.
+* **Integrity Verification**: Automated "Verify Dataset" tool to cross-reference 6,800+ SQL paths against local physical storage.
 
 
 
