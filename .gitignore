@@ -1,0 +1,9 @@
+# Ignore the actual image data
+Kayu/
+data/database.db
+
+# Ignore Python artifacts
+__pycache__/
+*.pyc
+venv/
+.env
