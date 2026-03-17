@@ -7,3 +7,13 @@ __pycache__/
 *.pyc
 venv/
 .env
+
+
+# Virtual Environments
+torch_env/
+app/torch_env/
+venv/
+env/
+
+# Trained Models
+*.pth
