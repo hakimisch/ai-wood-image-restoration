@@ -7,9 +7,8 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import os
 
-# Import your blank brain
-from models import SimpleRestorationNet
-from models import SRCNN
+# Import all your brains!
+from models import SimpleRestorationNet, SRCNN, VDSR
 
 class WoodDataset(Dataset):
     """Custom PyTorch Dataset that reads straight from your SQLite Database."""
@@ -47,12 +46,31 @@ class WoodDataset(Dataset):
         return blur_img, clear_img
 
 def train():
-    # 1. Setup Device (Bind to your GTX 1660 Ti)
+    # --- CONFIGURATION ---
+    # Change this string to "Simple CNN", "SRCNN", or "VDSR" to swap models
+    CHOSEN_MODEL = "VDSR" 
+    EPOCHS = 10
+    BATCH_SIZE = 8 # Lowered to 8 to be safe for VDSR on a 6GB GTX 1660 Ti
+    # ---------------------
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Training on device: {device}")
 
+    # 1. Setup Model and Save Path
+    if CHOSEN_MODEL == "Simple CNN":
+        model = SimpleRestorationNet().to(device)
+        save_path = "weights.pth"
+    elif CHOSEN_MODEL == "SRCNN":
+        model = SRCNN().to(device)
+        save_path = "srcnn_weights.pth"
+    elif CHOSEN_MODEL == "VDSR":
+        model = VDSR().to(device)
+        save_path = "vdsr_weights.pth"
+    else:
+        print("❌ Unknown model chosen!")
+        return
+
     # 2. Prepare Data
-    # Resizing to 256x256 to ensure it fits in the 1660 Ti's VRAM
     transform = transforms.Compose([
         transforms.ToPILImage(),
         transforms.Resize((256, 256)),
@@ -60,56 +78,39 @@ def train():
     ])
     
     dataset = WoodDataset(db_path='data/database.db', transform=transform)
-    
-    # DataLoader feeds the images to the GPU in batches of 16
-    dataloader = DataLoader(dataset, batch_size=16, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-    # 3. Initialize Model, Loss (MSE), and Optimizer
-    model = SRCNN().to(device)
-    criterion = nn.MSELoss() # Maps to thesis Section 3.6.3.3
+    # 3. Initialize Loss (MSE) and Optimizer
+    criterion = nn.MSELoss() 
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     # 4. The Training Loop
-    epochs = 10 # Start with 10 sweeps through the 6,800 images
-    
-    print("🧠 Starting Training...")
-    for epoch in range(epochs):
+    print(f"🧠 Starting Training for {CHOSEN_MODEL}...")
+    for epoch in range(EPOCHS):
         model.train()
         running_loss = 0.0
         
         for batch_idx, (blur_imgs, clear_imgs) in enumerate(dataloader):
-            # Move images to the GPU
             blur_imgs = blur_imgs.to(device)
             clear_imgs = clear_imgs.to(device)
             
-            # Zero the gradients
             optimizer.zero_grad()
-            
-            # Forward pass: AI guesses the clear image
             outputs = model(blur_imgs)
-            
-            # Calculate how wrong the guess was (Loss)
             loss = criterion(outputs, clear_imgs)
-            
-            # Backward pass: Calculate the adjustments
             loss.backward()
-            
-            # Optimizer step: Apply the adjustments to the brain
             optimizer.step()
             
             running_loss += loss.item()
             
-            # Print progress every 50 batches
             if batch_idx % 50 == 0:
-                print(f"Epoch [{epoch+1}/{epochs}] | Batch [{batch_idx}/{len(dataloader)}] | Loss: {loss.item():.4f}")
+                print(f"Epoch [{epoch+1}/{EPOCHS}] | Batch [{batch_idx}/{len(dataloader)}] | Loss: {loss.item():.4f}")
                 
-        # Average loss for the epoch
         epoch_loss = running_loss / len(dataloader)
         print(f"✅ Epoch {epoch+1} Complete. Average Loss: {epoch_loss:.4f}\n")
 
     # 5. Save the trained brain!
-    torch.save(model.state_dict(), "srcnn_weights.pth")
-    print("🎉 Training Complete! Brain saved to 'weights.pth'.")
+    torch.save(model.state_dict(), save_path)
+    print(f"🎉 Training Complete! Brain saved to '{save_path}'.")
 
 if __name__ == "__main__":
     train()

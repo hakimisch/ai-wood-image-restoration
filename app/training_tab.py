@@ -4,6 +4,7 @@ import sys
 import os
 import sqlite3
 import cv2
+import random
 import numpy as np
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QPushButton, QComboBox, QTextEdit, QProgressBar, 
@@ -15,35 +16,48 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+import torchvision.transforms as T
+import torchvision.transforms.functional as TF
+from datetime import datetime
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 
 # Import your AI models
-from models import SimpleRestorationNet, SRCNN
+from models import SimpleRestorationNet, SRCNN, VDSR
 
 class WoodDataset(Dataset):
-    """Custom PyTorch Dataset that reads from your SQLite Database."""
+    """Custom PyTorch Dataset that generates dynamic optical blurs."""
     def __init__(self, db_path='data/database.db', transform=None):
         self.transform = transform
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT blur_path, clear_path FROM samples")
-        self.image_pairs = cursor.fetchall()
+        cursor.execute("SELECT clear_path FROM samples")
+        self.image_paths = cursor.fetchall()
         conn.close()
 
     def __len__(self):
-        return len(self.image_pairs)
+        return len(self.image_paths)
 
     def __getitem__(self, idx):
-        blur_path, clear_path = self.image_pairs[idx]
-        blur_img = cv2.cvtColor(cv2.imread(blur_path), cv2.COLOR_BGR2RGB)
-        clear_img = cv2.cvtColor(cv2.imread(clear_path), cv2.COLOR_BGR2RGB)
+        clear_path = self.image_paths[idx][0]
+        
+        clear_img_bgr = cv2.imread(clear_path)
+        clear_img_rgb = cv2.cvtColor(clear_img_bgr, cv2.COLOR_BGR2RGB)
         
         if self.transform:
-            blur_img = self.transform(blur_img)
-            clear_img = self.transform(clear_img)
+            clear_tensor = self.transform(clear_img_rgb)
+        else:
+            clear_tensor = T.ToTensor()(clear_img_rgb)
             
-        return blur_img, clear_img
+        # The AI learns to fix everything from tiny focal issues (3x3) 
+        # to massive optical blurs (21x21).
+        kernel_sizes = [3, 5, 7, 9, 11, 13, 15, 17, 19, 21] 
+        chosen_kernel = random.choice(kernel_sizes)
+        
+        blur_tensor = TF.gaussian_blur(clear_tensor, kernel_size=[chosen_kernel, chosen_kernel])
+
+        return blur_tensor, clear_tensor
+
 
 class AITrainingThread(QThread):
     """Background thread to handle heavy PyTorch training without freezing the GUI."""
@@ -63,13 +77,15 @@ class AITrainingThread(QThread):
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.log_signal.emit(f"🚀 Initializing Training on: {device}")
             
-            # Setup Model
             if self.model_name == "Simple CNN (Custom)":
                 model = SimpleRestorationNet().to(device)
                 save_path = "weights.pth"
             elif self.model_name == "SRCNN (Custom)":
                 model = SRCNN().to(device)
                 save_path = "srcnn_weights.pth"
+            elif self.model_name == "VDSR (Custom)": 
+                model = VDSR().to(device)
+                save_path = "vdsr_weights.pth"
             else:
                 self.log_signal.emit(f"❌ {self.model_name} not implemented yet.")
                 self.finished_signal.emit()
@@ -85,10 +101,29 @@ class AITrainingThread(QThread):
             dataset = WoodDataset(db_path='data/database.db', transform=transform)
             dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
             
-            criterion = nn.MSELoss()
-            optimizer = optim.Adam(model.parameters(), lr=0.001)
+            l1_loss = nn.L1Loss()
+            mse_loss = nn.MSELoss()
+
+            def tv_loss(img):
+                return torch.mean(torch.abs(img[:, :, :, :-1] - img[:, :, :, 1:])) + \
+                       torch.mean(torch.abs(img[:, :, :-1, :] - img[:, :, 1:, :]))
+
+            # --- UPDATED: Balanced Loss Function ---
+            # 50% L1 (Sharpness) + 40% MSE (Smoothness/Safety) + 10% TV (Artifact Reduction)
+            def criterion(pred, target):
+                l1 = l1_loss(pred, target)
+                mse = mse_loss(pred, target)
+                tv = tv_loss(pred)
+                return 0.5 * l1 + 0.4 * mse + 0.0001 * tv
+
+            learning_rate = 0.0001
+            optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+            scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
 
             total_batches = len(dataloader)
+            
+            # --- CRITICAL FIX: Initialize best_loss before training loop ---
+            best_loss = float('inf')
             
             self.log_signal.emit(f"🧠 Starting Training: {self.epochs} Epochs | Batch Size: {self.batch_size}")
             
@@ -96,38 +131,59 @@ class AITrainingThread(QThread):
             for epoch in range(self.epochs):
                 model.train()
                 running_loss = 0.0
-                
+    
                 for batch_idx, (blur_imgs, clear_imgs) in enumerate(dataloader):
                     blur_imgs, clear_imgs = blur_imgs.to(device), clear_imgs.to(device)
-                    
+        
                     optimizer.zero_grad()
+
                     outputs = model(blur_imgs)
+
                     loss = criterion(outputs, clear_imgs)
                     loss.backward()
+                    
+                    # --- NEW: Gradient Clipping ---
+                    # Prevents the weights from exploding and causing massive VOL spikes at high epochs
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    
                     optimizer.step()
-                    
+        
                     running_loss += loss.item()
-                    
-                    # Update Progress Bar (Total progress across all epochs)
+        
                     current_step = (epoch * total_batches) + batch_idx
                     total_steps = self.epochs * total_batches
                     self.progress_signal.emit(int((current_step / total_steps) * 100))
-                    
+        
                     if batch_idx % 50 == 0:
-                        self.log_signal.emit(f"Epoch [{epoch+1}/{self.epochs}] | Batch [{batch_idx}/{total_batches}] | Loss: {loss.item():.4f}")
-                        
+                        self.log_signal.emit(
+                            f"Epoch [{epoch+1}/{self.epochs}] | "
+                            f"Batch [{batch_idx}/{total_batches}] | "
+                            f"Loss: {loss.item():.4f}"
+                        )
+            
+                scheduler.step()
+                current_lr = scheduler.get_last_lr()[0]
+    
                 avg_loss = running_loss / total_batches
-                self.log_signal.emit(f"✅ Epoch {epoch+1} Complete. Avg Loss: {avg_loss:.4f}")
+                self.log_signal.emit(
+                    f"✅ Epoch {epoch+1} Complete. "
+                    f"Avg Loss: {avg_loss:.4f} | LR: {current_lr:.6f}"
+                )
 
-            # Save the trained brain
-            torch.save(model.state_dict(), save_path)
-            self.log_signal.emit(f"🎉 Training Complete! Weights saved to '{save_path}'.")
+                # --- RESTORED: Early Stopping / Best Weight Saver ---
+                if avg_loss < best_loss:
+                    best_loss = avg_loss
+                    torch.save(model.state_dict(), save_path)
+                    self.log_signal.emit(f"🌟 New best model saved! (Loss: {best_loss:.4f})")
+
+            # Final save backup just in case
+            torch.save(model.state_dict(), f"final_{save_path}")
+            self.log_signal.emit(f"🎉 Training Complete! Best weights saved to '{save_path}'.")
             
             # --- EVALUATION LOOP (PSNR & SSIM) ---
             self.log_signal.emit("📊 Starting Mathematical Evaluation (PSNR/SSIM)...")
             model.eval()
             
-            # Reconnect to DB to grab 50 random test images
             conn = sqlite3.connect('data/database.db')
             cursor = conn.cursor()
             cursor.execute("SELECT blur_path, clear_path FROM samples ORDER BY RANDOM() LIMIT 50")
@@ -140,21 +196,49 @@ class AITrainingThread(QThread):
                     blur_img = cv2.cvtColor(cv2.imread(blur_path), cv2.COLOR_BGR2RGB)
                     clear_img = cv2.cvtColor(cv2.imread(clear_path), cv2.COLOR_BGR2RGB)
                     clear_img_resized = cv2.resize(clear_img, (256, 256))
-                    
+        
                     input_tensor = transform(blur_img).unsqueeze(0).to(device)
-                    output_tensor = model(input_tensor)
-                    
+
+                    output_tensor = torch.clamp(model(input_tensor), 0.0, 1.0)
+
                     output_img = output_tensor.squeeze().permute(1, 2, 0).cpu().numpy()
                     output_img = (np.clip(output_img, 0, 1) * 255).astype(np.uint8)
-                    
+        
                     total_psnr += psnr(clear_img_resized, output_img, data_range=255)
-                    total_ssim += ssim(clear_img_resized, output_img, data_range=255, channel_axis=-1, win_size=3)
+                    total_ssim += ssim(
+                        clear_img_resized,
+                        output_img,
+                        data_range=255,
+                        channel_axis=-1,
+                        win_size=3
+                    )
 
             avg_psnr = total_psnr / 50
             avg_ssim = total_ssim / 50
             
             self.log_signal.emit(f"📈 Final Evaluation -> PSNR: {avg_psnr:.2f} dB | SSIM: {avg_ssim:.4f}")
             self.metrics_signal.emit(avg_psnr, avg_ssim)
+
+            self.log_signal.emit("💾 Saving metrics to database...")
+            conn = sqlite3.connect('data/database.db')
+            
+            conn.execute('''CREATE TABLE IF NOT EXISTS model_metrics
+                            (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                             model_name TEXT,
+                             epochs INTEGER,
+                             batch_size INTEGER,
+                             final_loss REAL,
+                             psnr REAL,
+                             ssim REAL,
+                             timestamp TEXT)''')
+                             
+            conn.execute('''INSERT INTO model_metrics 
+                            (model_name, epochs, batch_size, final_loss, psnr, ssim, timestamp)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                         (self.model_name, self.epochs, self.batch_size, avg_loss, avg_psnr, avg_ssim, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            conn.commit()
+            conn.close()
+            self.log_signal.emit("✅ Metrics saved successfully!")
             
         except Exception as e:
             self.log_signal.emit(f"❌ CRITICAL ERROR: {str(e)}")
@@ -182,7 +266,7 @@ class TrainingTab(QWidget):
         self.model_selector.addItems([
             "Simple CNN (Custom)", 
             "SRCNN (Custom)", 
-            "VDSR (Upcoming)", 
+            "VDSR (Custom)", 
             "SwinIR (Upcoming)"
         ])
         control_layout.addWidget(self.model_selector)
@@ -196,7 +280,7 @@ class TrainingTab(QWidget):
         control_layout.addWidget(QLabel("Batch Size:"))
         self.batch_spinbox = QSpinBox()
         self.batch_spinbox.setRange(1, 64)
-        self.batch_spinbox.setValue(8) # Safe default for 6GB VRAM
+        self.batch_spinbox.setValue(8) 
         control_layout.addWidget(self.batch_spinbox)
         
         self.btn_train = QPushButton("▶ START TRAINING")
@@ -258,7 +342,6 @@ class TrainingTab(QWidget):
         epochs = self.epoch_spinbox.value()
         batch_size = self.batch_spinbox.value()
         
-        # Initialize and start the background thread
         self.thread = AITrainingThread(model_name, epochs, batch_size)
         self.thread.log_signal.connect(self.update_console)
         self.thread.progress_signal.connect(self.progress_bar.setValue)
@@ -268,7 +351,6 @@ class TrainingTab(QWidget):
 
     def update_console(self, text):
         self.console_output.append(text)
-        # Auto-scroll to bottom
         scrollbar = self.console_output.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
