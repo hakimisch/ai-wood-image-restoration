@@ -81,8 +81,187 @@ class VDSR(nn.Module):
         # VDSR trick: Predict the missing details (x), then add it to the original blurry image (residual)!
         return x + residual
 
+# --- 4. Custom Model: SwinIR (Vision Transformer) ---
+# Note: This is a Lightweight SwinIR configuration optimized for a 6GB GTX 1660 Ti.
+
+def window_partition(x, window_size):
+    """Chops the image tensor into non-overlapping windows."""
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    return windows
+
+def window_reverse(windows, window_size, H, W):
+    """Stitches the windows back together into a full image."""
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    return x
+
+class WindowAttention(nn.Module):
+    """Calculates how every pixel relates to every other pixel within a window."""
+    def __init__(self, dim, window_size, num_heads):
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        # Define a parameter table for relative position bias
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads))
+        nn.init.trunc_normal_(self.relative_position_bias_table, std=.02)
+
+        coords_h = torch.arange(self.window_size[0])
+        coords_w = torch.arange(self.window_size[1])
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))
+        coords_flatten = torch.flatten(coords, 1)
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+        relative_coords[:, :, 0] += self.window_size[0] - 1
+        relative_coords[:, :, 1] += self.window_size[1] - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+        relative_position_index = relative_coords.sum(-1)
+        self.register_buffer("relative_position_index", relative_position_index)
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=True)
+        self.proj = nn.Linear(dim, dim)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x, mask=None):
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        q = q * self.scale
+        attn = (q @ k.transpose(-2, -1))
+
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        attn = attn + relative_position_bias.unsqueeze(0)
+
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+
+        attn = self.softmax(attn)
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = self.proj(x)
+        return x
+
+class SwinTransformerBlock(nn.Module):
+    """The core building block that shifts the windows to create global context."""
+    def __init__(self, dim, input_resolution, num_heads, window_size=8, shift_size=0):
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift_size = shift_size
+
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = WindowAttention(dim, window_size=(self.window_size, self.window_size), num_heads=num_heads)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim)
+        )
+
+    def forward(self, x):
+        H, W = self.input_resolution
+        B, L, C = x.shape
+        shortcut = x
+        x = self.norm1(x)
+        x = x.view(B, H, W, C)
+
+        # Cyclic shift
+        if self.shift_size > 0:
+            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        else:
+            shifted_x = x
+
+        x_windows = window_partition(shifted_x, self.window_size)
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
+
+        # W-MSA/SW-MSA
+        attn_windows = self.attn(x_windows, mask=None) 
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        shifted_x = window_reverse(attn_windows, self.window_size, H, W)
+
+        # Reverse cyclic shift
+        if self.shift_size > 0:
+            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            x = shifted_x
+
+        x = x.view(B, H * W, C)
+        x = shortcut + x
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class BasicLayer(nn.Module):
+    """A sequence of Swin Blocks (Residual Swin Transformer Block - RSTB)."""
+    def __init__(self, dim, input_resolution, depth, num_heads, window_size):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            SwinTransformerBlock(dim=dim, input_resolution=input_resolution, num_heads=num_heads, window_size=window_size,
+                                 shift_size=0 if (i % 2 == 0) else window_size // 2)
+            for i in range(depth)])
+        self.conv = nn.Conv2d(dim, dim, 3, 1, 1)
+
+    def forward(self, x, H, W):
+        b, c, h, w = x.shape
+        x_flat = x.flatten(2).transpose(1, 2)
+        shortcut = x_flat
+        for block in self.blocks:
+            x_flat = block(x_flat)
+        x_out = x_flat.transpose(1, 2).view(b, c, h, w)
+        x_out = self.conv(x_out)
+        return x + x_out
+
 class SwinIR(nn.Module):
-    pass # To be implemented
+    """The Master Vision Transformer Wrapper."""
+    def __init__(self, img_size=256, in_chans=3, embed_dim=60, depths=[6, 6, 6, 6], num_heads=[6, 6, 6, 6], window_size=8):
+        super().__init__()
+        # 1. Shallow Feature Extraction
+        self.conv_first = nn.Conv2d(in_chans, embed_dim, 3, 1, 1)
+
+        # 2. Deep Feature Extraction (The Transformer blocks)
+        self.layers = nn.ModuleList()
+        for i in range(len(depths)):
+            layer = BasicLayer(dim=embed_dim, input_resolution=(img_size, img_size),
+                               depth=depths[i], num_heads=num_heads[i], window_size=window_size)
+            self.layers.append(layer)
+
+        self.conv_after_body = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
+
+        # 3. High-Quality Image Reconstruction
+        self.conv_last = nn.Conv2d(embed_dim, in_chans, 3, 1, 1)
+
+    def forward(self, x):
+        # Save the original blurry image for the residual skip connection
+        shortcut = x 
+        
+        # Extract features
+        x_first = self.conv_first(x)
+        res = x_first
+        
+        # Pass through the Transformer layers
+        for layer in self.layers:
+            res = layer(res, x.shape[2], x.shape[3])
+            
+        res = self.conv_after_body(res)
+        res = res + x_first
+        
+        # Reconstruct the final image
+        out = self.conv_last(res)
+        
+        # Add the learned sharp details back onto the blurry input
+        return out + shortcut
 
 class RealESRGAN_Wrapper():
     pass # To be implemented (Will use pre-trained external weights)

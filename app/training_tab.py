@@ -1,251 +1,415 @@
 # app/training_tab.py
-
-import sys
+#
+# Prerequisite: run generate_blur_dataset.py once before training.
+# That script fills data/blurred/ and writes blur_path into the DB.
+# Training then reads pre-generated (blur, clear) pairs — no on-the-fly
+# CPU blur math, no worker pickling overhead, maximum GPU utilisation.
+ 
 import os
 import sqlite3
 import cv2
-import random
 import numpy as np
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QPushButton, QComboBox, QTextEdit, QProgressBar, 
-                             QGroupBox, QSpinBox, QMessageBox)
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                             QPushButton, QComboBox, QTextEdit, QProgressBar,
+                             QGroupBox, QSpinBox, QMessageBox, QLineEdit)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-
+ 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-import torchvision.transforms as T
-import torchvision.transforms.functional as TF
+import random
 from datetime import datetime
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
-
-# Import your AI models
-from models import SimpleRestorationNet, SRCNN, VDSR
-
+ 
+from models import SimpleRestorationNet, SRCNN, VDSR, SwinIR
+ 
+ 
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+ 
 class WoodDataset(Dataset):
-    """Custom PyTorch Dataset that generates dynamic optical blurs."""
-    def __init__(self, db_path='data/database.db', transform=None):
+    """Reads pre-generated (blur, clear) pairs from data/blurred/.
+
+    The DB's blur_path column is never read or written here — old
+    acquisition-tab blur paths in Kayu/.../blur/ are left completely
+    untouched. Pairing is done by matching bare filenames between
+    data/blurred/ and the clear_path filenames stored in the DB.
+    """
+
+    BLUR_DIR = 'data/blurred'
+
+    def __init__(self, db_path='data/database.db', transform=None, log_fn=None, split='train'):
         self.transform = transform
+        self.split = split
+
+        # Build filename -> clear_path lookup from DB (read-only, no writes)
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         cursor.execute("SELECT clear_path FROM samples")
-        self.image_paths = cursor.fetchall()
+        clear_by_name = {os.path.basename(row[0]): row[0] for row in cursor.fetchall()}
         conn.close()
 
+        if not os.path.isdir(self.BLUR_DIR):
+            raise RuntimeError(
+                f"'{self.BLUR_DIR}' folder not found.\n"
+                "Please run  generate_blur_dataset.py  first."
+            )
+
+        self.image_pairs = []
+        skipped = 0
+        for fname in os.listdir(self.BLUR_DIR):
+            if not fname.lower().endswith(('.jpg', '.jpeg', '.png')):
+                continue
+            clear_path = clear_by_name.get(fname)
+            if clear_path is None:
+                skipped += 1
+                continue
+            blur_path = os.path.join(self.BLUR_DIR, fname).replace('\\', '/')
+            self.image_pairs.append((blur_path, clear_path))
+
+        # Academic Constraint: Data Leakage Prevention & Deterministic Splits
+        self.image_pairs.sort() # Ensure consistent order
+        rng = random.Random(42)
+        rng.shuffle(self.image_pairs)
+
+        if len(self.image_pairs) > 50:
+            if self.split == 'train':
+                self.image_pairs = self.image_pairs[:-50]
+            elif self.split == 'test':
+                self.image_pairs = self.image_pairs[-50:]
+        else:
+            if self.split == 'test':
+                self.image_pairs = self.image_pairs[:1]
+            elif self.split == 'train':
+                self.image_pairs = self.image_pairs[1:]
+
+        if not self.image_pairs:
+            raise RuntimeError(
+                f"No matching pairs found for split '{self.split}'.\n"
+                "Ensure filenames in data/blurred/ match the clear image filenames."
+            )
+
+        if log_fn:
+            msg = f"📦 Dataset ready: {len(self.image_pairs)} pairs (Split: {self.split.upper()})."
+            if skipped and self.split == 'train':
+                msg += f" ({skipped} files in data/blurred/ had no DB match — skipped.)"
+            log_fn(msg)
+
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.image_pairs)
 
     def __getitem__(self, idx):
-        clear_path = self.image_paths[idx][0]
-        
-        clear_img_bgr = cv2.imread(clear_path)
-        clear_img_rgb = cv2.cvtColor(clear_img_bgr, cv2.COLOR_BGR2RGB)
-        
+        blur_path, clear_path = self.image_pairs[idx]
+
+        # Read directly as NumPy uint8 — no PIL round-trip overhead
+        blur_np  = cv2.cvtColor(cv2.imread(blur_path),  cv2.COLOR_BGR2RGB)
+        clear_np = cv2.cvtColor(cv2.imread(clear_path), cv2.COLOR_BGR2RGB)
+
         if self.transform:
-            clear_tensor = self.transform(clear_img_rgb)
-        else:
-            clear_tensor = T.ToTensor()(clear_img_rgb)
-            
-        # The AI learns to fix everything from tiny focal issues (3x3) 
-        # to massive optical blurs (21x21).
-        kernel_sizes = [3, 5, 7, 9, 11, 13, 15, 17, 19, 21] 
-        chosen_kernel = random.choice(kernel_sizes)
-        
-        blur_tensor = TF.gaussian_blur(clear_tensor, kernel_size=[chosen_kernel, chosen_kernel])
+            # Random crop: identical window applied to both arrays
+            h, w    = blur_np.shape[:2]
+            top     = random.randint(0, max(0, h - 256))
+            left    = random.randint(0, max(0, w - 256))
+            blur_np  = blur_np[top:top+256, left:left+256]
+            clear_np = clear_np[top:top+256, left:left+256]
 
-        return blur_tensor, clear_tensor
+            # Shared horizontal flip
+            if random.random() > 0.5:
+                blur_np  = blur_np[:, ::-1].copy()
+                clear_np = clear_np[:, ::-1].copy()
 
+            # Shared vertical flip
+            if random.random() > 0.5:
+                blur_np  = blur_np[::-1].copy()
+                clear_np = clear_np[::-1].copy()
 
+        # HWC uint8 -> CHW float32 [0,1] without touching PIL
+        blur_t  = torch.from_numpy(blur_np.transpose(2, 0, 1)).float()  / 255.0
+        clear_t = torch.from_numpy(clear_np.transpose(2, 0, 1)).float() / 255.0
+        return blur_t, clear_t
+ 
+ 
+# ---------------------------------------------------------------------------
+# Training thread
+# ---------------------------------------------------------------------------
+ 
 class AITrainingThread(QThread):
-    """Background thread to handle heavy PyTorch training without freezing the GUI."""
-    log_signal = pyqtSignal(str)
+    log_signal      = pyqtSignal(str)
     progress_signal = pyqtSignal(int)
-    metrics_signal = pyqtSignal(float, float) # PSNR, SSIM
+    metrics_signal  = pyqtSignal(float, float)
     finished_signal = pyqtSignal()
-
-    def __init__(self, model_name, epochs, batch_size):
+ 
+    def __init__(self, model_name, epochs, batch_size, loss_type, save_name, use_amp, accum_steps, lr):
         super().__init__()
-        self.model_name = model_name
-        self.epochs = epochs
-        self.batch_size = batch_size
-
+        self.model_name   = model_name
+        self.epochs       = epochs
+        self.batch_size   = batch_size
+        self.loss_type    = loss_type
+        self.save_name    = save_name
+        self.use_amp      = use_amp
+        self.accum_steps  = accum_steps
+        self.lr           = lr
+ 
     def run(self):
         try:
+            # Academic Constraint: Enforce Reproducibility Seed
+            torch.manual_seed(42)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(42)
+            np.random.seed(42)
+            random.seed(42)
+
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.log_signal.emit(f"🚀 Initializing Training on: {device}")
-            
+            if self.use_amp:
+                mode_str = "AMP (Mixed Precision FP16)"
+            elif self.accum_steps > 1:
+                mode_str = f"FP32 + Gradient Accumulation (×{self.accum_steps} = effective batch {self.batch_size * self.accum_steps})"
+            else:
+                mode_str = "FP32 Baseline"
+            self.log_signal.emit(f"⚡ Training Mode: {mode_str}")
+ 
+            # ----------------------------------------------------------------
+            # Model
+            # ----------------------------------------------------------------
             if self.model_name == "Simple CNN (Custom)":
                 model = SimpleRestorationNet().to(device)
-                save_path = "weights.pth"
             elif self.model_name == "SRCNN (Custom)":
                 model = SRCNN().to(device)
-                save_path = "srcnn_weights.pth"
-            elif self.model_name == "VDSR (Custom)": 
+            elif self.model_name == "VDSR (Custom)":
                 model = VDSR().to(device)
-                save_path = "vdsr_weights.pth"
+            elif self.model_name == "SwinIR (Custom)":
+                model = SwinIR().to(device)
             else:
                 self.log_signal.emit(f"❌ {self.model_name} not implemented yet.")
                 self.finished_signal.emit()
                 return
-
-            transform = transforms.Compose([
-                transforms.ToPILImage(),
-                transforms.Resize((256, 256)),
-                transforms.ToTensor()
-            ])
-            
-            self.log_signal.emit("📦 Loading dataset from SQLite...")
-            dataset = WoodDataset(db_path='data/database.db', transform=transform)
-            dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
-            
-            l1_loss = nn.L1Loss()
+ 
+            save_path = self.save_name
+ 
+            # ----------------------------------------------------------------
+            # Dataset + DataLoader
+            # ----------------------------------------------------------------
+            dataset = WoodDataset(
+                db_path='data/database.db',
+                transform=True,
+                log_fn=self.log_signal.emit,
+                split='train'
+            )
+ 
+            if self.model_name == "SwinIR (Custom)" and self.batch_size > 1:
+                self.log_signal.emit("⚠️ SwinIR: forcing batch size to 1 to protect VRAM.")
+                self.batch_size = 1
+ 
+            dataloader = DataLoader(
+                dataset,
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_workers=0, # Kept at 0 to prevent Windows IO bottleneck
+                pin_memory=True,
+            )
+ 
+            # ----------------------------------------------------------------
+            # Loss
+            # ----------------------------------------------------------------
+            l1_loss  = nn.L1Loss()
             mse_loss = nn.MSELoss()
-
+ 
             def tv_loss(img):
-                return torch.mean(torch.abs(img[:, :, :, :-1] - img[:, :, :, 1:])) + \
-                       torch.mean(torch.abs(img[:, :, :-1, :] - img[:, :, 1:, :]))
-
-            # --- UPDATED: Balanced Loss Function ---
-            # 50% L1 (Sharpness) + 40% MSE (Smoothness/Safety) + 10% TV (Artifact Reduction)
+                return (torch.mean(torch.abs(img[:, :, :, :-1] - img[:, :, :, 1:])) +
+                        torch.mean(torch.abs(img[:, :, :-1, :] - img[:, :, 1:, :])))
+ 
             def criterion(pred, target):
-                l1 = l1_loss(pred, target)
-                mse = mse_loss(pred, target)
-                tv = tv_loss(pred)
-                return 0.5 * l1 + 0.4 * mse + 0.0001 * tv
+                if "Hybrid" in self.loss_type:
+                    return 0.2 * l1_loss(pred, target) + 0.8 * mse_loss(pred, target) + 0.0001 * tv_loss(pred)
+                return mse_loss(pred, target)
+ 
+            # ----------------------------------------------------------------
+            # Optimiser + Scheduler
+            # ----------------------------------------------------------------
+            optimizer = optim.Adam(model.parameters(), lr=self.lr)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs, eta_min=1e-6)
+            self.log_signal.emit(f"📉 CosineAnnealingLR: {self.lr:.0e} → 1e-6 over {self.epochs} epochs")
+ 
+            # AMP scaler (only used when AMP mode is active)
+            scaler = torch.amp.GradScaler("cuda") if self.use_amp else None
+            torch.cuda.empty_cache()
 
-            learning_rate = 0.0001
-            optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-            scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+            # Gradient accumulation only applies in FP32 mode.
+            effective_accum = 1 if self.use_amp else self.accum_steps
+            effective_batch  = self.batch_size * effective_accum
 
             total_batches = len(dataloader)
-            
-            # --- CRITICAL FIX: Initialize best_loss before training loop ---
-            best_loss = float('inf')
-            
-            self.log_signal.emit(f"🧠 Starting Training: {self.epochs} Epochs | Batch Size: {self.batch_size}")
-            
-            # --- TRAINING LOOP ---
+            best_loss     = float('inf')
+
+            self.log_signal.emit(
+                f"🧠 Starting Training: {self.epochs} epochs | "
+                f"Physical batch: {self.batch_size} | "
+                f"Effective batch: {effective_batch} | "
+                f"Batches/epoch: {total_batches}"
+            )
+
+            # ----------------------------------------------------------------
+            # Training loop
+            # ----------------------------------------------------------------
             for epoch in range(self.epochs):
                 model.train()
                 running_loss = 0.0
-    
+                optimizer.zero_grad(set_to_none=True)
+
                 for batch_idx, (blur_imgs, clear_imgs) in enumerate(dataloader):
-                    blur_imgs, clear_imgs = blur_imgs.to(device), clear_imgs.to(device)
-        
-                    optimizer.zero_grad()
+                    blur_imgs  = blur_imgs.to(device)
+                    clear_imgs = clear_imgs.to(device)
 
-                    outputs = model(blur_imgs)
+                    if self.use_amp:
+                        # AMP path (FP16, no accumulation)
+                        with torch.amp.autocast("cuda"):
+                            outputs = model(blur_imgs)
+                            loss    = criterion(outputs, clear_imgs)
+                        scaler.scale(loss).backward()
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad(set_to_none=True)
+                        running_loss += loss.item()
 
-                    loss = criterion(outputs, clear_imgs)
-                    loss.backward()
-                    
-                    # --- NEW: Gradient Clipping ---
-                    # Prevents the weights from exploding and causing massive VOL spikes at high epochs
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    
-                    optimizer.step()
-        
-                    running_loss += loss.item()
-        
-                    current_step = (epoch * total_batches) + batch_idx
-                    total_steps = self.epochs * total_batches
-                    self.progress_signal.emit(int((current_step / total_steps) * 100))
-        
+                    else:
+                        # FP32 path (with optional gradient accumulation)
+                        outputs = model(blur_imgs)
+                        loss    = criterion(outputs, clear_imgs) / effective_accum
+                        loss.backward()
+                        running_loss += loss.item() * effective_accum
+
+                        is_step = (batch_idx + 1) % effective_accum == 0 or (batch_idx + 1) == total_batches
+                        if is_step:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                            optimizer.step()
+                            optimizer.zero_grad(set_to_none=True)
+
+                    current_step = epoch * total_batches + batch_idx
+                    total_steps  = self.epochs * total_batches
+                    self.progress_signal.emit(int(current_step / total_steps * 100))
+
                     if batch_idx % 50 == 0:
+                        display_loss = loss.item() if self.use_amp else loss.item() * effective_accum
                         self.log_signal.emit(
                             f"Epoch [{epoch+1}/{self.epochs}] | "
                             f"Batch [{batch_idx}/{total_batches}] | "
-                            f"Loss: {loss.item():.4f}"
+                            f"Loss: {display_loss:.4f}"
                         )
-            
+
                 scheduler.step()
+                avg_loss   = running_loss / total_batches
                 current_lr = scheduler.get_last_lr()[0]
-    
-                avg_loss = running_loss / total_batches
                 self.log_signal.emit(
-                    f"✅ Epoch {epoch+1} Complete. "
+                    f"✅ Epoch {epoch+1} complete — "
                     f"Avg Loss: {avg_loss:.4f} | LR: {current_lr:.6f}"
                 )
 
-                # --- RESTORED: Early Stopping / Best Weight Saver ---
                 if avg_loss < best_loss:
                     best_loss = avg_loss
                     torch.save(model.state_dict(), save_path)
-                    self.log_signal.emit(f"🌟 New best model saved! (Loss: {best_loss:.4f})")
-
-            # Final save backup just in case
+                    self.log_signal.emit(f"🌟 New best saved (loss: {best_loss:.4f})")
+ 
             torch.save(model.state_dict(), f"final_{save_path}")
-            self.log_signal.emit(f"🎉 Training Complete! Best weights saved to '{save_path}'.")
-            
-            # --- EVALUATION LOOP (PSNR & SSIM) ---
-            self.log_signal.emit("📊 Starting Mathematical Evaluation (PSNR/SSIM)...")
+            self.log_signal.emit(f"🎉 Training complete. Best weights → '{save_path}'")
+ 
+            # ----------------------------------------------------------------
+            # Evaluation (PSNR / SSIM)
+            # ----------------------------------------------------------------
+            self.log_signal.emit("📊 Running PSNR/SSIM evaluation on 50 holdout samples...")
             model.eval()
-            
-            conn = sqlite3.connect('data/database.db')
-            cursor = conn.cursor()
-            cursor.execute("SELECT blur_path, clear_path FROM samples ORDER BY RANDOM() LIMIT 50")
-            test_pairs = cursor.fetchall()
-            conn.close()
-
-            total_psnr, total_ssim = 0.0, 0.0
+ 
+            # Load the dedicated evaluation split to prevent Data Leakage
+            test_dataset = WoodDataset(
+                db_path='data/database.db',
+                transform=False,
+                log_fn=None,
+                split='test'
+            )
+            test_pairs = test_dataset.image_pairs
+ 
+            eval_transform = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.CenterCrop(256),
+                transforms.ToTensor(),
+            ])
+ 
+            total_psnr = total_ssim_val = 0.0
             with torch.no_grad():
                 for blur_path, clear_path in test_pairs:
-                    blur_img = cv2.cvtColor(cv2.imread(blur_path), cv2.COLOR_BGR2RGB)
+                    blur_img  = cv2.cvtColor(cv2.imread(blur_path),  cv2.COLOR_BGR2RGB)
                     clear_img = cv2.cvtColor(cv2.imread(clear_path), cv2.COLOR_BGR2RGB)
-                    clear_img_resized = cv2.resize(clear_img, (256, 256))
-        
-                    input_tensor = transform(blur_img).unsqueeze(0).to(device)
-
-                    output_tensor = torch.clamp(model(input_tensor), 0.0, 1.0)
-
-                    output_img = output_tensor.squeeze().permute(1, 2, 0).cpu().numpy()
-                    output_img = (np.clip(output_img, 0, 1) * 255).astype(np.uint8)
-        
-                    total_psnr += psnr(clear_img_resized, output_img, data_range=255)
-                    total_ssim += ssim(
-                        clear_img_resized,
-                        output_img,
-                        data_range=255,
-                        channel_axis=-1,
-                        win_size=3
-                    )
-
-            avg_psnr = total_psnr / 50
-            avg_ssim = total_ssim / 50
-            
-            self.log_signal.emit(f"📈 Final Evaluation -> PSNR: {avg_psnr:.2f} dB | SSIM: {avg_ssim:.4f}")
+ 
+                    clear_tensor = eval_transform(clear_img)
+                    input_tensor = eval_transform(blur_img).unsqueeze(0).to(device)
+ 
+                    clear_np = (np.clip(clear_tensor.permute(1, 2, 0).numpy(), 0, 1) * 255).astype(np.uint8)
+ 
+                    out_tensor = torch.clamp(model(input_tensor), 0.0, 1.0)
+                    out_np     = (out_tensor.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+ 
+                    total_psnr     += psnr(clear_np, out_np, data_range=255)
+                    total_ssim_val += ssim(clear_np, out_np, data_range=255, channel_axis=-1, win_size=3)
+ 
+            n_eval   = max(len(test_pairs), 1)   # guard against empty list
+            avg_psnr = total_psnr     / n_eval
+            avg_ssim = total_ssim_val / n_eval
+            self.log_signal.emit(f"📈 Holdout PSNR: {avg_psnr:.2f} dB | SSIM: {avg_ssim:.4f}")
             self.metrics_signal.emit(avg_psnr, avg_ssim)
-
-            self.log_signal.emit("💾 Saving metrics to database...")
+ 
+            # Save metrics to DB
             conn = sqlite3.connect('data/database.db')
-            
             conn.execute('''CREATE TABLE IF NOT EXISTS model_metrics
-                            (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                             model_name TEXT,
-                             epochs INTEGER,
-                             batch_size INTEGER,
-                             final_loss REAL,
-                             psnr REAL,
-                             ssim REAL,
-                             timestamp TEXT)''')
-                             
-            conn.execute('''INSERT INTO model_metrics 
-                            (model_name, epochs, batch_size, final_loss, psnr, ssim, timestamp)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                         (self.model_name, self.epochs, self.batch_size, avg_loss, avg_psnr, avg_ssim, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 model_name TEXT, epochs INTEGER, batch_size INTEGER,
+                 final_loss REAL, psnr REAL, ssim REAL, timestamp TEXT,
+                 pth_filename TEXT, loss_type TEXT, accum_steps INTEGER)''')
+            # Add new columns gracefully if DB was created by an older version
+            for col, typedef in [
+                ("pth_filename", "TEXT"),
+                ("loss_type",    "TEXT"),
+                ("accum_steps",  "INTEGER"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE model_metrics ADD COLUMN {col} {typedef}")
+                except Exception:
+                    pass  # column already exists
+            conn.execute(
+                "INSERT INTO model_metrics "
+                "(model_name, epochs, batch_size, final_loss, psnr, ssim, "
+                " timestamp, pth_filename, loss_type, accum_steps) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (self.model_name, self.epochs, self.batch_size,
+                 avg_loss, avg_psnr, avg_ssim,
+                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                 os.path.basename(save_path),
+                 self.loss_type,
+                 self.accum_steps)
+            )
             conn.commit()
             conn.close()
-            self.log_signal.emit("✅ Metrics saved successfully!")
-            
+            self.log_signal.emit("💾 Metrics saved to database.")
+ 
         except Exception as e:
             self.log_signal.emit(f"❌ CRITICAL ERROR: {str(e)}")
-            
         finally:
             self.progress_signal.emit(100)
             self.finished_signal.emit()
+ 
+ 
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+
+_GRP  = "QGroupBox { font-weight: bold; border: 1px solid #bdc3c7; border-radius: 6px; margin-top: 8px; padding-top: 6px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; color: #2c3e50; }"
+_BLUE = "QGroupBox { font-weight: bold; border: 2px solid #2980b9; border-radius: 6px; margin-top: 8px; padding-top: 6px; background: #eaf3fb; } QGroupBox::title { subcontrol-origin: margin; left: 10px; color: #1a5276; }"
+_TIP  = "font-size: 11px; color: #7f8c8d; font-style: italic;"
 
 
 class TrainingTab(QWidget):
@@ -254,95 +418,257 @@ class TrainingTab(QWidget):
         self.setup_ui()
 
     def setup_ui(self):
+        from PyQt6.QtWidgets import QRadioButton, QButtonGroup
+
         layout = QVBoxLayout()
-        
-        # --- TOP: Controls ---
-        control_group = QGroupBox("Training Configuration")
-        control_group.setStyleSheet("font-weight: bold;")
-        control_layout = QHBoxLayout()
-        
-        control_layout.addWidget(QLabel("Select Model:"))
+        layout.setSpacing(6)
+
+        # Training Configuration row
+        base_group = QGroupBox("Training Configuration")
+        base_group.setStyleSheet(_GRP)
+        base_layout = QHBoxLayout()
+
+        base_layout.addWidget(QLabel("Model:"))
         self.model_selector = QComboBox()
         self.model_selector.addItems([
-            "Simple CNN (Custom)", 
-            "SRCNN (Custom)", 
-            "VDSR (Custom)", 
-            "SwinIR (Upcoming)"
+            "Simple CNN (Custom)", "SRCNN (Custom)", "VDSR (Custom)", "SwinIR (Custom)"
         ])
-        control_layout.addWidget(self.model_selector)
-        
-        control_layout.addWidget(QLabel("Epochs:"))
+        self.model_selector.setMinimumWidth(180)
+        base_layout.addWidget(self.model_selector)
+        base_layout.addSpacing(10)
+
+        base_layout.addWidget(QLabel("Epochs:"))
         self.epoch_spinbox = QSpinBox()
         self.epoch_spinbox.setRange(1, 100)
-        self.epoch_spinbox.setValue(10)
-        control_layout.addWidget(self.epoch_spinbox)
-        
-        control_layout.addWidget(QLabel("Batch Size:"))
+        self.epoch_spinbox.setValue(30)
+        self.epoch_spinbox.setFixedWidth(70)
+        base_layout.addWidget(self.epoch_spinbox)
+        base_layout.addSpacing(10)
+
+        base_layout.addWidget(QLabel("Batch Size:"))
         self.batch_spinbox = QSpinBox()
         self.batch_spinbox.setRange(1, 64)
-        self.batch_spinbox.setValue(8) 
-        control_layout.addWidget(self.batch_spinbox)
+        self.batch_spinbox.setValue(8)
+        self.batch_spinbox.setFixedWidth(70)
+        base_layout.addWidget(self.batch_spinbox)
+        base_layout.addSpacing(10)
         
-        self.btn_train = QPushButton("▶ START TRAINING")
-        self.btn_train.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; padding: 5px;")
+        base_layout.addWidget(QLabel("Learning Rate:"))
+        self.lr_selector = QComboBox()
+        self.lr_selector.addItems(["1e-3", "1e-4", "5e-5", "1e-5"])
+        self.lr_selector.setCurrentText("1e-4")
+        self.lr_selector.setFixedWidth(70)
+        base_layout.addWidget(self.lr_selector)
+
+        base_layout.addWidget(QLabel("Loss Function:"))
+        self.loss_selector = QComboBox()
+        self.loss_selector.addItems(["Pure MSE (Safe Baseline)", "Hybrid (80% MSE + 20% L1)"])
+        self.loss_selector.setMinimumWidth(200)
+        base_layout.addWidget(self.loss_selector)
+        base_layout.addStretch()
+        base_group.setLayout(base_layout)
+
+        # Precision & Batch Strategy group (blue-bordered)
+        prec_group = QGroupBox("Precision & Batch Strategy")
+        prec_group.setStyleSheet(_BLUE)
+        prec_layout = QVBoxLayout()
+        prec_layout.setSpacing(4)
+
+        radio_row = QHBoxLayout()
+        self.radio_fp32  = QRadioButton("FP32 Baseline")
+        self.radio_accum = QRadioButton("FP32 + Gradient Accumulation  ★ recommended for GTX 1660 Ti")
+        self.radio_amp   = QRadioButton("AMP Mixed Precision  (FP16 — best on RTX 20xx/30xx/40xx)")
+        self.radio_accum.setChecked(True)
+
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.addButton(self.radio_fp32,  0)
+        self.mode_group.addButton(self.radio_accum, 1)
+        self.mode_group.addButton(self.radio_amp,   2)
+
+        radio_row.addWidget(self.radio_fp32)
+        radio_row.addSpacing(16)
+        radio_row.addWidget(self.radio_accum)
+        radio_row.addSpacing(16)
+        radio_row.addWidget(self.radio_amp)
+        radio_row.addStretch()
+
+        accum_row = QHBoxLayout()
+        self.accum_label   = QLabel("Accumulation Steps:")
+        self.accum_spinbox = QSpinBox()
+        self.accum_spinbox.setRange(2, 8)
+        self.accum_spinbox.setValue(2)
+        self.accum_spinbox.setFixedWidth(60)
+        self.accum_tip = QLabel()
+        self.accum_tip.setStyleSheet(_TIP)
+        accum_row.addSpacing(20)
+        accum_row.addWidget(self.accum_label)
+        accum_row.addWidget(self.accum_spinbox)
+        accum_row.addWidget(self.accum_tip)
+        accum_row.addStretch()
+
+        self.mode_desc = QLabel()
+        self.mode_desc.setStyleSheet(_TIP)
+        self.mode_desc.setWordWrap(True)
+
+        prec_layout.addLayout(radio_row)
+        prec_layout.addLayout(accum_row)
+        prec_layout.addWidget(self.mode_desc)
+        prec_group.setLayout(prec_layout)
+
+        # Output / save row
+        save_group = QGroupBox("Output")
+        save_group.setStyleSheet(_GRP)
+        save_layout = QHBoxLayout()
+        save_layout.addWidget(QLabel("Save Weights As:"))
+        self.save_name_input = QLineEdit()
+        save_layout.addWidget(self.save_name_input, stretch=1)
+        self.btn_train = QPushButton("▶  START TRAINING")
+        self.btn_train.setStyleSheet(
+            "background-color: #27ae60; color: white; font-weight: bold; "
+            "padding: 6px 18px; border-radius: 4px;"
+        )
+        self.btn_train.setMinimumHeight(34)
         self.btn_train.clicked.connect(self.start_training)
-        control_layout.addWidget(self.btn_train)
-        
-        control_group.setLayout(control_layout)
-        
-        # --- MIDDLE: Live Console ---
+        save_layout.addWidget(self.btn_train)
+        save_group.setLayout(save_layout)
+
+        # Console
         console_group = QGroupBox("Live Training Console")
-        console_group.setStyleSheet("font-weight: bold;")
+        console_group.setStyleSheet(_GRP)
         console_layout = QVBoxLayout()
-        
         self.console_output = QTextEdit()
         self.console_output.setReadOnly(True)
-        self.console_output.setStyleSheet("background-color: #2c3e50; color: #ecf0f1; font-family: Consolas; font-weight: normal;")
+        self.console_output.setStyleSheet(
+            "background-color: #2c3e50; color: #ecf0f1; "
+            "font-family: Consolas; font-size: 12px; font-weight: normal;"
+        )
         console_layout.addWidget(self.console_output)
-        
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
         console_layout.addWidget(self.progress_bar)
-        
         console_group.setLayout(console_layout)
-        
-        # --- BOTTOM: Evaluation Metrics ---
+
+        # Metrics
         metrics_group = QGroupBox("Section 3.6.3: Evaluation Metrics")
-        metrics_group.setStyleSheet("font-weight: bold;")
+        metrics_group.setStyleSheet(_GRP)
         metrics_layout = QHBoxLayout()
-        
         self.psnr_label = QLabel("PSNR: -- dB")
         self.psnr_label.setStyleSheet("font-size: 18px; color: #2980b9;")
         self.psnr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
         self.ssim_label = QLabel("SSIM: --")
         self.ssim_label.setStyleSheet("font-size: 18px; color: #8e44ad;")
         self.ssim_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
         metrics_layout.addWidget(self.psnr_label)
         metrics_layout.addWidget(self.ssim_label)
         metrics_group.setLayout(metrics_layout)
-        
-        # Add everything to main layout
-        layout.addWidget(control_group)
+
+        layout.addWidget(base_group)
+        layout.addWidget(prec_group)
+        layout.addWidget(save_group)
         layout.addWidget(console_group, stretch=1)
         layout.addWidget(metrics_group)
         self.setLayout(layout)
 
+        # Signals
+        self.model_selector.currentTextChanged.connect(self.update_default_filename)
+        self.loss_selector.currentTextChanged.connect(self.update_default_filename)
+        self.mode_group.idToggled.connect(self.on_mode_changed)
+        self.accum_spinbox.valueChanged.connect(self.on_accum_changed)
+        self.batch_spinbox.valueChanged.connect(self.on_accum_changed)
+
+        self.on_mode_changed()
+        self.update_default_filename()
+
+    def on_accum_changed(self, *_):
+        """Recompute the effective-batch tip whenever batch size or steps change."""
+        if self.mode_group.checkedId() == 1:
+            eff = self.batch_spinbox.value() * self.accum_spinbox.value()
+            self.accum_tip.setText(
+                f"effective batch = {self.batch_spinbox.value()} "
+                f"\u00d7 {self.accum_spinbox.value()} = {eff}"
+            )
+        self.update_default_filename()
+
+    def on_mode_changed(self, *_):
+        mode       = self.mode_group.checkedId()
+        show_accum = (mode == 1)
+        self.accum_label.setVisible(show_accum)
+        self.accum_spinbox.setVisible(show_accum)
+        self.accum_tip.setVisible(show_accum)
+        if show_accum:
+            eff = self.batch_spinbox.value() * self.accum_spinbox.value()
+            self.accum_tip.setText(
+                f"effective batch = {self.batch_spinbox.value()} "
+                f"\u00d7 {self.accum_spinbox.value()} = {eff}"
+            )
+        descs = {
+            0: "Standard FP32. One optimizer step per batch. Good for debugging or baseline comparisons.",
+            1: "FP32 + gradient accumulation: gradients are summed over N mini-batches before each "
+               "optimizer step, simulating a larger effective batch without extra VRAM. "
+               "Same speed as FP32 baseline, better gradient stability. Best choice for GTX 1660 Ti.",
+            2: "Mixed precision (FP16 forward/backward, FP32 optimizer state). Fastest on cards with "
+               "strong second-gen+ Tensor Cores (RTX 20xx/30xx/40xx). "
+               "On GTX 1660 Ti the autocast + GradScaler overhead typically makes this slower than FP32.",
+        }
+        self.mode_desc.setText(descs.get(mode, ""))
+        self.update_default_filename()
+
+    def update_default_filename(self, *_):
+        model_text = self.model_selector.currentText()
+        loss_text  = self.loss_selector.currentText()
+        mode       = self.mode_group.checkedId()
+
+        if   "Simple" in model_text: model_abbr = "sCNN"
+        elif "SRCNN"  in model_text: model_abbr = "srcnn"
+        elif "VDSR"   in model_text: model_abbr = "vdsr"
+        elif "Swin"   in model_text: model_abbr = "swinir"
+        else:                        model_abbr = "model"
+
+        loss_abbr = "mse" if ("MSE" in loss_text and "Hybrid" not in loss_text) else "hybrid"
+
+        if   mode == 0: mode_abbr = "fp32"
+        elif mode == 1: mode_abbr = f"accum{self.accum_spinbox.value()}"
+        else:           mode_abbr = "amp"
+
+        now = datetime.now()
+        self.save_name_input.setText(
+            f"{model_abbr}_{loss_abbr}_{mode_abbr}_{now.month}_{now.day}.pth"
+        )
+
     def start_training(self):
-        """Disables buttons and starts the PyTorch thread."""
         self.btn_train.setEnabled(False)
         self.model_selector.setEnabled(False)
+        self.loss_selector.setEnabled(False)
+        self.lr_selector.setEnabled(False)
+        self.radio_fp32.setEnabled(False)
+        self.radio_accum.setEnabled(False)
+        self.radio_amp.setEnabled(False)
+        self.accum_spinbox.setEnabled(False)
+        self.save_name_input.setEnabled(False)
         self.console_output.clear()
         self.progress_bar.setValue(0)
         self.psnr_label.setText("PSNR: Calculating...")
         self.ssim_label.setText("SSIM: Calculating...")
-        
-        model_name = self.model_selector.currentText()
-        epochs = self.epoch_spinbox.value()
-        batch_size = self.batch_spinbox.value()
-        
-        self.thread = AITrainingThread(model_name, epochs, batch_size)
+
+        save_name = self.save_name_input.text().strip()
+        if not save_name.endswith(".pth"):
+            save_name += ".pth"
+
+        mode    = self.mode_group.checkedId()
+        use_amp = (mode == 2)
+        accum   = self.accum_spinbox.value() if mode == 1 else 1
+        lr_val  = float(self.lr_selector.currentText())
+
+        self.thread = AITrainingThread(
+            model_name  = self.model_selector.currentText(),
+            epochs      = self.epoch_spinbox.value(),
+            batch_size  = self.batch_spinbox.value(),
+            loss_type   = self.loss_selector.currentText(),
+            save_name   = save_name,
+            use_amp     = use_amp,
+            accum_steps = accum,
+            lr          = lr_val
+        )
         self.thread.log_signal.connect(self.update_console)
         self.thread.progress_signal.connect(self.progress_bar.setValue)
         self.thread.metrics_signal.connect(self.update_metrics)
@@ -351,8 +677,9 @@ class TrainingTab(QWidget):
 
     def update_console(self, text):
         self.console_output.append(text)
-        scrollbar = self.console_output.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        self.console_output.verticalScrollBar().setValue(
+            self.console_output.verticalScrollBar().maximum()
+        )
 
     def update_metrics(self, psnr_val, ssim_val):
         self.psnr_label.setText(f"PSNR: {psnr_val:.2f} dB")
@@ -361,4 +688,14 @@ class TrainingTab(QWidget):
     def training_finished(self):
         self.btn_train.setEnabled(True)
         self.model_selector.setEnabled(True)
-        QMessageBox.information(self, "Success", "Training & Evaluation Complete!\nYou can now test it in the AI Restoration Tab.")
+        self.loss_selector.setEnabled(True)
+        self.lr_selector.setEnabled(True)
+        self.radio_fp32.setEnabled(True)
+        self.radio_accum.setEnabled(True)
+        self.radio_amp.setEnabled(True)
+        self.accum_spinbox.setEnabled(True)
+        self.save_name_input.setEnabled(True)
+        QMessageBox.information(
+            self, "Success",
+            "Training & Evaluation Complete!\nYou can now test it in the AI Restoration Tab."
+        )

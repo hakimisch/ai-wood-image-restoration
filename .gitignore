@@ -1,6 +1,7 @@
 # Ignore the actual image data
 Kayu/
 data/database.db
+data/
 
 # Ignore Python artifacts
 __pycache__/
