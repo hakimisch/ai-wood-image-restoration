@@ -4,47 +4,34 @@
 # It reads every clear image from the database, applies a random blur
 # (Gaussian, out-of-focus, or motion) with continuous sigma, saves the
 # blurred image to data/blurred/, and writes the blur_path back to the DB.
-#
-# After this runs, training becomes pure disk I/O — no CPU blur math
-# per batch, no worker pickling overhead, maximum GPU utilisation.
-#
-# Usage:
-#   python generate_blur_dataset.py
-#
-# Re-run any time you want to regenerate with fresh random blurs.
-# Each run overwrites the blurred folder and resets blur_path in the DB.
- 
+
 import os
 import cv2
 import random
 import sqlite3
 import numpy as np
- 
+
 DB_PATH      = 'data/database.db'
 BLUR_OUT_DIR = 'data/blurred'
- 
+
 os.makedirs(BLUR_OUT_DIR, exist_ok=True)
- 
+
 # ---------------------------------------------------------------------------
 # Blur kernel helpers
 # ---------------------------------------------------------------------------
- 
+
 def make_gaussian_blur(img_rgb, sigma):
     """Standard Gaussian blur via torchvision-compatible sigma."""
-    k = max(3, int(np.ceil(6 * sigma)) | 1)  # Always odd, min 3
-    # cv2.GaussianBlur expects (kW, kH) and sigma
+    k = max(3, int(np.ceil(6 * sigma)) | 1)  
     return cv2.GaussianBlur(img_rgb, (k, k), sigmaX=sigma, sigmaY=sigma)
- 
- 
+
 def make_out_of_focus_blur(img_rgb, sigma):
     """Disk/elliptical bokeh blur simulating physical defocus."""
     k = max(3, int(np.ceil(6 * sigma)) | 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     kernel = kernel.astype(np.float32) / kernel.sum()
-    # filter2D works on float32 [0,1] or uint8 — works on RGB directly
     return cv2.filter2D(img_rgb, -1, kernel)
- 
- 
+
 def make_motion_blur(img_rgb):
     """Linear motion blur at a random angle and streak length."""
     length = random.randint(5, 21)
@@ -58,60 +45,129 @@ def make_motion_blur(img_rgb):
 def make_space_variant_blur(img_rgb):
     """Simulates a tilted microscope stage (focal plane gradient) via alpha blending."""
     h, w = img_rgb.shape[:2]
-
-    # 1. Pick two extremes for the focal tilt (e.g., sharp vs heavily out of focus)
     sigma_sharp  = random.uniform(0.1, 1.0)
     sigma_blurry = random.uniform(3.0, 6.0)
 
-    # Focal tilt is a physical lens effect, so we use out-of-focus (disk) blur
     img_sharp  = make_out_of_focus_blur(img_rgb, sigma_sharp).astype(np.float32)
     img_blurry = make_out_of_focus_blur(img_rgb, sigma_blurry).astype(np.float32)
 
-    # 2. Generate a 2D linear gradient mask [0.0 to 1.0]
     mask = np.zeros((h, w, 1), dtype=np.float32)
     is_vertical = random.random() > 0.5
 
     if is_vertical:
-        # Tilt from top-to-bottom
         grad = np.linspace(0, 1, h, dtype=np.float32)
-        if random.random() > 0.5: grad = grad[::-1] # Flip direction
+        if random.random() > 0.5: grad = grad[::-1] 
         mask[:, :, 0] = np.tile(grad[:, None], (1, w))
     else:
-        # Tilt from left-to-right
         grad = np.linspace(0, 1, w, dtype=np.float32)
-        if random.random() > 0.5: grad = grad[::-1] # Flip direction
+        if random.random() > 0.5: grad = grad[::-1] 
         mask[:, :, 0] = np.tile(grad[None, :], (h, 1))
 
-    # 3. Blend the two images using the gradient mask
     blended = (img_sharp * mask) + (img_blurry * (1.0 - mask))
     return np.clip(blended, 0, 255).astype(np.uint8)
- 
- 
-def apply_random_blur(img_rgb):
-    """Pick a random blur type and strength, return blurred RGB image."""
-    rand_val = random.random()
+
+# ---------------------------------------------------------------------------
+# Camera Degradation Helpers
+# ---------------------------------------------------------------------------
+
+def add_sensor_noise(img_rgb, sigma=None):
+    """Gaussian sensor noise matching typical USB microscope cameras."""
+    if sigma is None:
+        sigma = random.uniform(1.0, 6.0) # Tuned down to prevent information death
+    noise = np.random.normal(0, sigma, img_rgb.shape).astype(np.float32)
+    return np.clip(img_rgb.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+def simulate_camera_isp(img_rgb):
+    """Simulates the camera's internal Auto-Exposure and Gamma correction."""
+    # Gamma < 1.0 darkens shadows/increases contrast, Gamma > 1.0 washes out
+    gamma = random.uniform(0.7, 1.2)
     
-    # 1. THE >900 VOL FIX (10% Chance: Identity Mapping)
-    # Teaches the AI to leave already-sharp images alone
-    if rand_val < 0.10:
-        return img_rgb
+    # Build a lookup table for fast Gamma correction
+    invGamma = 1.0 / gamma
+    table = np.array([((i / 255.0) ** invGamma) * 255
+                      for i in np.arange(0, 256)]).astype("uint8")
+    
+    return cv2.LUT(img_rgb, table)
+
+def add_lighting_variance(img_rgb):
+    """LED flicker and varied sample exposure."""
+    alpha = random.uniform(0.8, 1.2)   
+    beta  = random.uniform(-20, 20)    
+    return cv2.convertScaleAbs(img_rgb, alpha=alpha, beta=beta)
+
+def add_vignetting(img_rgb):
+    """Darker edges with a randomized, off-center focal point."""
+    rows, cols = img_rgb.shape[:2]
+    
+    # Shift the center of the light by up to 30% in any direction
+    center_x = (cols / 2) + random.uniform(-cols * 0.3, cols * 0.3)
+    center_y = (rows / 2) + random.uniform(-rows * 0.3, rows * 0.3)
+    
+    # Increase the kernel size slightly to soften the edge of the light pool
+    kx = cv2.getGaussianKernel(cols, cols / 1.5)
+    ky = cv2.getGaussianKernel(rows, rows / 1.5)
+    
+    # Shift the kernel to the new center
+    kx = np.roll(kx, int(center_x - cols/2))
+    ky = np.roll(ky, int(center_y - rows/2))
+    
+    mask = (ky * kx.T)
+    mask = mask / mask.max()
+    mask = np.expand_dims(mask, axis=2)
+    return np.clip(img_rgb * mask, 0, 255).astype(np.uint8)
+
+def add_jpeg_compression(image_rgb):
+    """Simulates the compression artifacts from a USB webcam stream."""
+    quality = random.randint(50, 95)
+    img_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+    _, encimg = cv2.imencode('.jpg', img_bgr, encode_param)
+    decoded_bgr = cv2.imdecode(encimg, cv2.IMREAD_COLOR)
+    return cv2.cvtColor(decoded_bgr, cv2.COLOR_BGR2RGB)
+
+# ---------------------------------------------------------------------------
+# The Master Degradation Pipeline
+# ---------------------------------------------------------------------------
+
+def apply_random_blur(img_rgb):
+    """Full physically-realistic degradation pipeline."""
+    rand_val = random.random()
+
+    # ── Stage 1: Lens & illumination ──────────────────────────────────────
+    if random.random() > 0.5:
+        img_rgb = add_lighting_variance(img_rgb)
+    if random.random() > 0.5:
+        img_rgb = add_vignetting(img_rgb)
+
+    # ── Stage 2: Optical blur (Compound Simulation) ───────────────────────
+    if rand_val >= 0.10: # 90% chance to get blurred
         
-    # 2. THE TILTED STAGE FIX (20% Chance: Space-Variant Blur)
-    # Teaches the AI to fix uneven wood surfaces and focal plane drift
-    if rand_val < 0.30:
-        return make_space_variant_blur(img_rgb)
+        # 1. GUARANTEED Base Focus
+        if random.random() < 0.25:
+            # 25% chance of space-variant (tilted stage)
+            img_rgb = make_space_variant_blur(img_rgb)
+        else:
+            # 75% chance of standard uniform blur
+            sigma = random.uniform(1.5, 3.0) 
+            
+            if random.random() < 0.5:
+                img_rgb = make_out_of_focus_blur(img_rgb, sigma)
+            else:
+                img_rgb = make_gaussian_blur(img_rgb, sigma)
+                
+        # 2. Additive Motion/Vibration (30% chance to stack on top of the base blur)
+        if random.random() < 0.30:
+            img_rgb = make_motion_blur(img_rgb)
 
-    # 3. THE <300 VOL FIX (70% Chance: Standard Uniform Blur)
-    # Widened sigma to 6.0 to handle extreme microscopic defocus
-    blur_type = random.choice(["gaussian", "out_of_focus", "motion"])
-    sigma     = random.uniform(0.1, 6.0)   
-
-    if blur_type == "gaussian":
-        return make_gaussian_blur(img_rgb, sigma)
-    elif blur_type == "out_of_focus":
-        return make_out_of_focus_blur(img_rgb, sigma)
-    else:
-        return make_motion_blur(img_rgb)
+    # ── Stage 3: Sensor & capture ─────────────────────────────────────────
+    img_rgb = add_sensor_noise(img_rgb)         
+    if random.random() > 0.30:
+        img_rgb = simulate_camera_isp(img_rgb)
+        
+    if random.random() > 0.30:                  
+        img_rgb = add_jpeg_compression(img_rgb)
+        
+    return img_rgb
  
 # ---------------------------------------------------------------------------
 # Main generation loop
@@ -120,7 +176,6 @@ def apply_random_blur(img_rgb):
 conn   = sqlite3.connect(DB_PATH)
 cursor = conn.cursor()
  
-# Ensure blur_path column exists (it may already from the original schema)
 cursor.execute("PRAGMA table_info(samples)")
 columns = [row[1] for row in cursor.fetchall()]
 if 'blur_path' not in columns:
@@ -132,37 +187,33 @@ cursor.execute("SELECT id, clear_path FROM samples")
 rows = cursor.fetchall()
 total = len(rows)
 print(f"Generating blurred images for {total} samples...")
-print("NOTE: This overwrites any existing blur_path values (including old fixed Gaussian blurs")
-print(f"      saved by the acquisition tab). New images go to '{BLUR_OUT_DIR}/'.")
  
 for i, (sample_id, clear_path) in enumerate(rows):
-    # Read clear image
+    
+    # 1. Read clean image
     img_bgr = cv2.imread(clear_path)
     if img_bgr is None:
         print(f"  ⚠️  Could not read {clear_path}, skipping.")
         continue
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
- 
-    # Apply random blur
+
+    # 2. Apply Master Pipeline (Lighting -> Blur -> Noise -> Compression)
     blurred_rgb = apply_random_blur(img_rgb)
     blurred_rgb = np.clip(blurred_rgb, 0, 255).astype(np.uint8)
  
-    # Build output path: data/blurred/<original_filename>
+    # 3. Save as BGR (OpenCV convention)
     filename  = os.path.basename(clear_path)
     blur_path = os.path.join(BLUR_OUT_DIR, filename).replace('\\', '/')
- 
-    # Save as BGR (OpenCV convention)
     blurred_bgr = cv2.cvtColor(blurred_rgb, cv2.COLOR_RGB2BGR)
     cv2.imwrite(blur_path, blurred_bgr)
  
-    # Write path back to DB
+    # 4. Write path back to DB
     cursor.execute("UPDATE samples SET blur_path = ? WHERE id = ?", (blur_path, sample_id))
  
-    # Progress report every 500 images
+    # Progress report
     if (i + 1) % 500 == 0 or (i + 1) == total:
         print(f"  [{i+1}/{total}] Done.")
  
 conn.commit()
 conn.close()
 print(f"\n✅ Blur generation complete. {total} blurred images saved to '{BLUR_OUT_DIR}/'.")
-print("You can now run training — epochs will use pre-generated blur pairs with no CPU overhead.")

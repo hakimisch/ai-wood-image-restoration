@@ -15,7 +15,6 @@ from PyQt6.QtGui import QImage, QPixmap
 try:
     from models import SimpleRestorationNet, SRCNN, VDSR, SwinIR
     import torch
-    import torchvision.transforms as T
     AI_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):
     AI_AVAILABLE = False
@@ -88,7 +87,7 @@ class AIRestorationTab(QWidget):
             elif model_name == "VDSR (Custom)":
                 self.model = VDSR()
             elif model_name == "SwinIR (Custom)":
-                self.model = SwinIR()
+                self.model = SwinIR(img_size=128)
             else:
                 self.rest_output_view.setText(f"{model_name} is not yet implemented.\nPlease select a valid model.")
                 self.rest_output_view.setStyleSheet("background: #ecf0f1; border: 3px dashed #e74c3c; color: #e74c3c;")
@@ -304,36 +303,72 @@ class AIRestorationTab(QWidget):
         self.output_vol_lbl.setText("Output VOL: --")
 
     def _process_in_patches(self, img_bgr, tile_size=256):
-        """Tile the image, run each tile through the model on GPU, stitch back."""
-        h, w, c      = img_bgr.shape
-        output_img   = np.zeros_like(img_bgr)
-        y_tiles      = math.ceil(h / tile_size)
-        x_tiles      = math.ceil(w / tile_size)
+        """Tile with overlap and blend to eliminate seam artifacts at tile boundaries.
 
-        for y in range(y_tiles):
-            for x in range(x_tiles):
-                y0, y1 = y * tile_size, min((y + 1) * tile_size, h)
-                x0, x1 = x * tile_size, min((x + 1) * tile_size, w)
+        Each tile is processed with an `overlap` pixel border on all sides that
+        it shares with a neighbour.  The results are blended using a linear
+        weight ramp so that the centre of each tile has full weight and the
+        edges taper to zero, making joins invisible.
 
-                tile   = img_bgr[y0:y1, x0:x1]
-                pad_h  = tile_size - (y1 - y0)
-                pad_w  = tile_size - (x1 - x0)
+        Overlap is set to 25% of tile_size (16px for 64px tiles, 64px for
+        256px tiles) — enough to cover any border artifact the model creates.
+        """
+        h, w, c  = img_bgr.shape
+        overlap  = tile_size // 4          # 16px for SwinIR, 64px for others
+        step     = tile_size - overlap     # stride between tile origins
+
+        # Accumulator arrays for blended output and weight sum
+        output_acc  = np.zeros((h, w, c), dtype=np.float32)
+        weight_acc  = np.zeros((h, w, 1),  dtype=np.float32)
+
+        # Build a 2-D weight mask: linear ramp from 0→1→0 on each axis,
+        # so the tile centre is weighted 1.0 and the overlapping edges taper
+        ramp   = np.linspace(0, 1, overlap, endpoint=False, dtype=np.float32)
+        ones   = np.ones(tile_size - 2 * overlap, dtype=np.float32)
+        ramp_1d = np.concatenate([ramp, ones, ramp[::-1]])[:tile_size]
+        weight_2d = np.outer(ramp_1d, ramp_1d)[:, :, np.newaxis]  # (T,T,1)
+
+        y_starts = list(range(0, h - tile_size + 1, step))
+        x_starts = list(range(0, w - tile_size + 1, step))
+        # Always include a tile that reaches the bottom/right edge
+        if not y_starts or y_starts[-1] + tile_size < h:
+            y_starts.append(max(0, h - tile_size))
+        if not x_starts or x_starts[-1] + tile_size < w:
+            x_starts.append(max(0, w - tile_size))
+
+        for y0 in y_starts:
+            y1 = min(y0 + tile_size, h)
+            for x0 in x_starts:
+                x1 = min(x0 + tile_size, w)
+
+                tile    = img_bgr[y0:y1, x0:x1]
+                th, tw  = tile.shape[:2]
+
+                # Pad to full tile_size if near an edge
+                pad_h = tile_size - th
+                pad_w = tile_size - tw
                 if pad_h > 0 or pad_w > 0:
                     tile = cv2.copyMakeBorder(tile, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
 
-                # Direct numpy->tensor, no PIL — move to same device as model
                 input_tensor = self._to_tensor(tile).unsqueeze(0).to(self.device)
-
                 with torch.no_grad():
                     out_tensor = self.model(input_tensor)
 
                 out_tile = out_tensor.squeeze().permute(1, 2, 0).cpu().numpy()
-                out_tile = (np.clip(out_tile, 0, 1) * 255).astype(np.uint8)
-                out_tile_bgr = cv2.cvtColor(out_tile, cv2.COLOR_RGB2BGR)
+                out_tile = np.clip(out_tile, 0, 1)
+                out_tile_bgr = cv2.cvtColor(
+                    (out_tile * 255).astype(np.uint8), cv2.COLOR_RGB2BGR
+                ).astype(np.float32)
 
-                output_img[y0:y1, x0:x1] = out_tile_bgr[0:(y1 - y0), 0:(x1 - x0)]
+                # Blend only the valid (non-padded) region
+                w2d = weight_2d[:th, :tw]
+                output_acc[y0:y1, x0:x1] += out_tile_bgr[:th, :tw] * w2d
+                weight_acc[y0:y1, x0:x1] += w2d
 
-        return output_img
+        # Normalise by accumulated weights (avoid divide-by-zero in corners)
+        weight_acc = np.maximum(weight_acc, 1e-6)
+        result = (output_acc / weight_acc).clip(0, 255).astype(np.uint8)
+        return result
 
     def run_inference(self):
         if self.current_frame is None or not self.ai_available or getattr(self, 'model', None) is None:
@@ -379,8 +414,14 @@ class AIRestorationTab(QWidget):
             )
             self.input_vol_lbl.setStyleSheet("font-weight: bold; font-size: 13px; color: #e74c3c;")
 
+            # Determine tile size dynamically
+            if "SwinIR" in self.model_selector.currentText():
+                t_size = 128
+            else:
+                t_size = 256
+
             t_start     = time.perf_counter()
-            output_bgr  = self._process_in_patches(upscaled_input, tile_size=256)
+            output_bgr  = self._process_in_patches(upscaled_input, tile_size=t_size)
             t_elapsed   = time.perf_counter() - t_start
 
             vol_out = calculate_vol(output_bgr)
@@ -392,9 +433,13 @@ class AIRestorationTab(QWidget):
                 f"VOL change from pre-AI: {sign}{delta:.1f}   |   "
                 f"Overall gain vs raw input: {sign}{vol_out - vol_in_raw:.1f}"
             )
+            overlap   = t_size // 4
+            step      = t_size - overlap
+            n_y = len(list(range(0, upscaled_input.shape[0] - t_size + 1, step))) + 1
+            n_x = len(list(range(0, upscaled_input.shape[1] - t_size + 1, step))) + 1
             self.inference_time_lbl.setText(
                 f"Inference: {t_elapsed:.2f}s  |  "
-                f"Tiles: {math.ceil(upscaled_input.shape[0]/256) * math.ceil(upscaled_input.shape[1]/256)}  |  "
+                f"Tiles: {n_y * n_x} (overlapping, {t_size}px)  |  "
                 f"Device: {self.device}"
             )
 

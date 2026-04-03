@@ -225,7 +225,7 @@ class BasicLayer(nn.Module):
 
 class SwinIR(nn.Module):
     """The Master Vision Transformer Wrapper."""
-    def __init__(self, img_size=256, in_chans=3, embed_dim=60, depths=[6, 6, 6, 6], num_heads=[6, 6, 6, 6], window_size=8):
+    def __init__(self, img_size=128, in_chans=3, embed_dim=60, depths=[6, 6, 6, 6], num_heads=[6, 6, 6, 6], window_size=8):
         super().__init__()
         # 1. Shallow Feature Extraction
         self.conv_first = nn.Conv2d(in_chans, embed_dim, 3, 1, 1)

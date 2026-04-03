@@ -42,9 +42,10 @@ class WoodDataset(Dataset):
 
     BLUR_DIR = 'data/blurred'
 
-    def __init__(self, db_path='data/database.db', transform=None, log_fn=None, split='train'):
+    def __init__(self, db_path='data/database.db', transform=None, log_fn=None, split='train', crop_size=256):
         self.transform = transform
         self.split = split
+        self.crop_size = crop_size
 
         # Build filename -> clear_path lookup from DB (read-only, no writes)
         conn = sqlite3.connect(db_path)
@@ -112,10 +113,10 @@ class WoodDataset(Dataset):
         if self.transform:
             # Random crop: identical window applied to both arrays
             h, w    = blur_np.shape[:2]
-            top     = random.randint(0, max(0, h - 256))
-            left    = random.randint(0, max(0, w - 256))
-            blur_np  = blur_np[top:top+256, left:left+256]
-            clear_np = clear_np[top:top+256, left:left+256]
+            top     = random.randint(0, max(0, h - self.crop_size))
+            left    = random.randint(0, max(0, w - self.crop_size))
+            blur_np  = blur_np[top:top + self.crop_size, left:left + self.crop_size]
+            clear_np = clear_np[top:top + self.crop_size, left:left + self.crop_size]
 
             # Shared horizontal flip
             if random.random() > 0.5:
@@ -126,6 +127,13 @@ class WoodDataset(Dataset):
             if random.random() > 0.5:
                 blur_np  = blur_np[::-1].copy()
                 clear_np = clear_np[::-1].copy()
+
+            if random.random() > 0.5:
+                # Rotate by 90, 180, or 270 degrees
+                k = random.randint(1, 3) 
+                # np.rot90 works perfectly on HWC arrays
+                blur_np  = np.rot90(blur_np, k).copy()
+                clear_np = np.rot90(clear_np, k).copy()
 
         # HWC uint8 -> CHW float32 [0,1] without touching PIL
         blur_t  = torch.from_numpy(blur_np.transpose(2, 0, 1)).float()  / 255.0
@@ -174,16 +182,21 @@ class AITrainingThread(QThread):
             self.log_signal.emit(f"⚡ Training Mode: {mode_str}")
  
             # ----------------------------------------------------------------
-            # Model
+            # Model & Dynamic Crop Size Initialization
             # ----------------------------------------------------------------
             if self.model_name == "Simple CNN (Custom)":
+                crop_size = 256
                 model = SimpleRestorationNet().to(device)
             elif self.model_name == "SRCNN (Custom)":
+                crop_size = 256
                 model = SRCNN().to(device)
             elif self.model_name == "VDSR (Custom)":
+                crop_size = 256
                 model = VDSR().to(device)
             elif self.model_name == "SwinIR (Custom)":
-                model = SwinIR().to(device)
+                crop_size = 128
+                model = SwinIR(img_size=128).to(device)
+                self.log_signal.emit("⚡ SwinIR detected: Overriding crop size to 128x128 for VRAM safety.")
             else:
                 self.log_signal.emit(f"❌ {self.model_name} not implemented yet.")
                 self.finished_signal.emit()
@@ -191,6 +204,7 @@ class AITrainingThread(QThread):
  
             save_path = self.save_name
  
+
             # ----------------------------------------------------------------
             # Dataset + DataLoader
             # ----------------------------------------------------------------
@@ -198,34 +212,26 @@ class AITrainingThread(QThread):
                 db_path='data/database.db',
                 transform=True,
                 log_fn=self.log_signal.emit,
-                split='train'
+                split='train',
+                crop_size=crop_size
             )
- 
-            if self.model_name == "SwinIR (Custom)" and self.batch_size > 1:
-                self.log_signal.emit("⚠️ SwinIR: forcing batch size to 1 to protect VRAM.")
-                self.batch_size = 1
- 
+
             dataloader = DataLoader(
                 dataset,
                 batch_size=self.batch_size,
                 shuffle=True,
-                num_workers=0, # Kept at 0 to prevent Windows IO bottleneck
+                num_workers=0,
                 pin_memory=True,
             )
- 
             # ----------------------------------------------------------------
             # Loss
             # ----------------------------------------------------------------
             l1_loss  = nn.L1Loss()
             mse_loss = nn.MSELoss()
  
-            def tv_loss(img):
-                return (torch.mean(torch.abs(img[:, :, :, :-1] - img[:, :, :, 1:])) +
-                        torch.mean(torch.abs(img[:, :, :-1, :] - img[:, :, 1:, :])))
- 
             def criterion(pred, target):
                 if "Hybrid" in self.loss_type:
-                    return 0.2 * l1_loss(pred, target) + 0.8 * mse_loss(pred, target) + 0.0001 * tv_loss(pred)
+                    return 0.2 * l1_loss(pred, target) + 0.8 * mse_loss(pred, target)
                 return mse_loss(pred, target)
  
             # ----------------------------------------------------------------
@@ -336,7 +342,7 @@ class AITrainingThread(QThread):
  
             eval_transform = transforms.Compose([
                 transforms.ToPILImage(),
-                transforms.CenterCrop(256),
+                transforms.CenterCrop(crop_size),
                 transforms.ToTensor(),
             ])
  
