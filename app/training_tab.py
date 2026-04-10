@@ -110,6 +110,10 @@ class WoodDataset(Dataset):
         blur_np  = cv2.cvtColor(cv2.imread(blur_path),  cv2.COLOR_BGR2RGB)
         clear_np = cv2.cvtColor(cv2.imread(clear_path), cv2.COLOR_BGR2RGB)
 
+        # This prevents the AI from over-sharpening in an attempt to recreate static sensor grain.
+        target_sigma = random.uniform(0.2, 0.6)
+        clear_np = cv2.GaussianBlur(clear_np, (3, 3), target_sigma)
+
         if self.transform:
             # Random crop: identical window applied to both arrays
             h, w    = blur_np.shape[:2]

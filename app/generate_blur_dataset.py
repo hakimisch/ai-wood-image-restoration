@@ -77,6 +77,29 @@ def add_sensor_noise(img_rgb, sigma=None):
     noise = np.random.normal(0, sigma, img_rgb.shape).astype(np.float32)
     return np.clip(img_rgb.astype(np.float32) + noise, 0, 255).astype(np.uint8)
 
+def add_camera_banding(img_rgb):
+    """Simulates LED PWM flicker and rolling shutter waves found in live microscope feeds."""
+    h, w = img_rgb.shape[:2]
+    
+    # Create coordinates for a 2D wave
+    y = np.arange(h).reshape(-1, 1)
+    x = np.arange(w).reshape(1, -1)
+    
+    # Randomize wave frequency (width) and tilt (diagonal shift)
+    freq_y = random.uniform(0.02, 0.08)
+    freq_x = random.uniform(-0.02, 0.02) 
+    
+    # Amplitude controls how dark/light the bands get. Keep it faint (like the real camera)
+    amplitude = random.uniform(3.0, 12.0) 
+    
+    # Generate the sine wave mask
+    wave = (np.sin(y * freq_y + x * freq_x) * amplitude).astype(np.float32)
+    wave_3d = np.repeat(wave[:, :, np.newaxis], 3, axis=2)
+    
+    # Apply the banding to the image
+    banded = np.clip(img_rgb.astype(np.float32) + wave_3d, 0, 255).astype(np.uint8)
+    return banded
+
 def simulate_camera_isp(img_rgb):
     """Simulates the camera's internal Auto-Exposure and Gamma correction."""
     # Gamma < 1.0 darkens shadows/increases contrast, Gamma > 1.0 washes out
@@ -133,13 +156,20 @@ def apply_random_blur(img_rgb):
     """Full physically-realistic degradation pipeline."""
     rand_val = random.random()
 
+    # ── Logic Gate: Prevent Contrast Stacking (The "Claude Fix") ──────────
+    # Decide HERE if we are doing physical lighting OR digital ISP, but never both.
+    apply_physical_light = random.random() > 0.5
+    apply_digital_isp    = not apply_physical_light and random.random() > 0.5
+    # ──────────────────────────────────────────────────────────────────────
+
     # ── Stage 1: Lens & illumination ──────────────────────────────────────
-    if random.random() > 0.5:
+    if apply_physical_light:
         img_rgb = add_lighting_variance(img_rgb)
+        
     if random.random() > 0.5:
         img_rgb = add_vignetting(img_rgb)
 
-    # ── Stage 2: Optical blur (Compound Simulation) ───────────────────────
+   # ── Stage 2: Optical blur (Compound Simulation) ───────────────────────
     if rand_val >= 0.10: # 90% chance to get blurred
         
         # 1. GUARANTEED Base Focus
@@ -148,7 +178,7 @@ def apply_random_blur(img_rgb):
             img_rgb = make_space_variant_blur(img_rgb)
         else:
             # 75% chance of standard uniform blur
-            sigma = random.uniform(1.5, 3.0) 
+            sigma = random.uniform(0.5, 5.0) 
             
             if random.random() < 0.5:
                 img_rgb = make_out_of_focus_blur(img_rgb, sigma)
@@ -160,8 +190,14 @@ def apply_random_blur(img_rgb):
             img_rgb = make_motion_blur(img_rgb)
 
     # ── Stage 3: Sensor & capture ─────────────────────────────────────────
+    # Inject the LED banding simulation ~50% of the time
+    if random.random() > 0.50:
+        img_rgb = add_camera_banding(img_rgb)
+        
     img_rgb = add_sensor_noise(img_rgb)         
-    if random.random() > 0.30:
+    
+    # This now safely checks the variable we defined at the very top
+    if apply_digital_isp:
         img_rgb = simulate_camera_isp(img_rgb)
         
     if random.random() > 0.30:                  

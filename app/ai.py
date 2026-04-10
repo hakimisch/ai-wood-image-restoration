@@ -360,8 +360,19 @@ class AIRestorationTab(QWidget):
                     (out_tile * 255).astype(np.uint8), cv2.COLOR_RGB2BGR
                 ).astype(np.float32)
 
+                # Clone the standard weight mask so we can alter it for edge cases
+                w2d = weight_2d.copy()
+
+                # Prevent dark borders: If a tile touches the absolute image edge, 
+                # force that side of the weight mask to 1.0
+                if y0 == 0:                  w2d[:overlap, :] = 1.0
+                if y1 == h:                  w2d[-overlap:, :] = 1.0
+                if x0 == 0:                  w2d[:, :overlap] = 1.0
+                if x1 == w:                  w2d[:, -overlap:] = 1.0
+
+                w2d = w2d[:th, :tw] # Crop if padded
+
                 # Blend only the valid (non-padded) region
-                w2d = weight_2d[:th, :tw]
                 output_acc[y0:y1, x0:x1] += out_tile_bgr[:th, :tw] * w2d
                 weight_acc[y0:y1, x0:x1] += w2d
 
@@ -389,30 +400,10 @@ class AIRestorationTab(QWidget):
             elif "4x" in scale_text: scale_factor = 4
             else:                    scale_factor = 1
 
-            self.rest_output_view.setText("Processing Tiled Restoration...\n(This may take a moment)")
+            self.rest_output_view.setText("Processing AI Restoration...\n(This may take a moment)")
             self.rest_output_view.repaint()
 
-            # Preserve aspect ratio instead of squashing to a fixed square.
-            # LANCZOS gives sharper upscale edges than INTER_CUBIC, which
-            # reduces the VOL loss from interpolation before the model runs.
-            orig_h, orig_w = ai_ready_frame.shape[:2]
-            if scale_factor > 1:
-                new_w = orig_w * scale_factor
-                new_h = orig_h * scale_factor
-                upscaled_input = cv2.resize(
-                    ai_ready_frame, (new_w, new_h),
-                    interpolation=cv2.INTER_LANCZOS4
-                )
-            else:
-                upscaled_input = ai_ready_frame
-
-            vol_in_raw  = calculate_vol(ai_ready_frame)     # raw input VOL
-            vol_pre_ai  = calculate_vol(upscaled_input)      # after upscale, before model
-
-            self.input_vol_lbl.setText(
-                f"Input VOL: {vol_in_raw:.1f}  →  Pre-AI: {vol_pre_ai:.1f} ({scale_factor}x)"
-            )
-            self.input_vol_lbl.setStyleSheet("font-weight: bold; font-size: 13px; color: #e74c3c;")
+            vol_in_raw = calculate_vol(ai_ready_frame)
 
             # Determine tile size dynamically
             if "SwinIR" in self.model_selector.currentText():
@@ -420,26 +411,40 @@ class AIRestorationTab(QWidget):
             else:
                 t_size = 256
 
-            t_start     = time.perf_counter()
-            output_bgr  = self._process_in_patches(upscaled_input, tile_size=t_size)
-            t_elapsed   = time.perf_counter() - t_start
+            # STEP 1: Run AI Inference at Native 1x Scale First
+            t_start = time.perf_counter()
+            restored_1x_bgr = self._process_in_patches(ai_ready_frame, tile_size=t_size)
+            t_elapsed = time.perf_counter() - t_start
 
-            vol_out = calculate_vol(output_bgr)
-            delta   = vol_out - vol_pre_ai
+            # STEP 2: Upscale the Pristine AI Output (if requested)
+            if scale_factor > 1:
+                orig_h, orig_w = restored_1x_bgr.shape[:2]
+                final_output_bgr = cv2.resize(
+                    restored_1x_bgr, 
+                    (orig_w * scale_factor, orig_h * scale_factor),
+                    interpolation=cv2.INTER_LANCZOS4
+                )
+            else:
+                final_output_bgr = restored_1x_bgr
+
+            vol_out = calculate_vol(final_output_bgr)
+            delta   = vol_out - vol_in_raw
             sign    = "+" if delta >= 0 else ""
 
+            self.input_vol_lbl.setText(f"Input VOL: {vol_in_raw:.1f}")
+            self.input_vol_lbl.setStyleSheet("font-weight: bold; font-size: 13px; color: #e74c3c;")
+
             self.output_vol_lbl.setText(f"Output VOL: {vol_out:.1f} ({scale_factor}x)")
-            self.vol_delta_lbl.setText(
-                f"VOL change from pre-AI: {sign}{delta:.1f}   |   "
-                f"Overall gain vs raw input: {sign}{vol_out - vol_in_raw:.1f}"
-            )
+            self.vol_delta_lbl.setText(f"Overall gain vs raw input: {sign}{delta:.1f}")
+            
             overlap   = t_size // 4
             step      = t_size - overlap
-            n_y = len(list(range(0, upscaled_input.shape[0] - t_size + 1, step))) + 1
-            n_x = len(list(range(0, upscaled_input.shape[1] - t_size + 1, step))) + 1
+            n_y = len(list(range(0, ai_ready_frame.shape[0] - t_size + 1, step))) + 1
+            n_x = len(list(range(0, ai_ready_frame.shape[1] - t_size + 1, step))) + 1
+            
             self.inference_time_lbl.setText(
                 f"Inference: {t_elapsed:.2f}s  |  "
-                f"Tiles: {n_y * n_x} (overlapping, {t_size}px)  |  "
+                f"Tiles: {n_y * n_x} ({t_size}px)  |  "
                 f"Device: {self.device}"
             )
 
@@ -451,7 +456,7 @@ class AIRestorationTab(QWidget):
             else:
                 self.output_vol_lbl.setStyleSheet("font-weight: bold; font-size: 14px; color: #e74c3c;")
 
-            pix = self._convert_cv_to_qpixmap(output_bgr, self.rest_output_view.width(), self.rest_output_view.height())
+            pix = self._convert_cv_to_qpixmap(final_output_bgr, self.rest_output_view.width(), self.rest_output_view.height())
             self.rest_output_view.setPixmap(pix)
             self.rest_output_view.setStyleSheet("border: 3px solid #27ae60;")
 
