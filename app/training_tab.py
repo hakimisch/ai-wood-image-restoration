@@ -24,7 +24,7 @@ from datetime import datetime
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
  
-from models import SimpleRestorationNet, SRCNN, VDSR, SwinIR
+from models import SimpleRestorationNet, SRCNN, VDSR, SwinIR, RRDBNet
  
  
 # ---------------------------------------------------------------------------
@@ -201,6 +201,10 @@ class AITrainingThread(QThread):
                 crop_size = 128
                 model = SwinIR(img_size=128).to(device)
                 self.log_signal.emit("⚡ SwinIR detected: Overriding crop size to 128x128 for VRAM safety.")
+            elif self.model_name == "Real-ESRGAN (Custom)":
+                crop_size = 96 
+                model = RRDBNet().to(device)
+                self.log_signal.emit("⚡ Real-ESRGAN detected: Overriding crop size to 96x96 for VRAM safety.")
             else:
                 self.log_signal.emit(f"❌ {self.model_name} not implemented yet.")
                 self.finished_signal.emit()
@@ -441,7 +445,7 @@ class TrainingTab(QWidget):
         base_layout.addWidget(QLabel("Model:"))
         self.model_selector = QComboBox()
         self.model_selector.addItems([
-            "Simple CNN (Custom)", "SRCNN (Custom)", "VDSR (Custom)", "SwinIR (Custom)"
+            "Simple CNN (Custom)", "SRCNN (Custom)", "VDSR (Custom)", "SwinIR (Custom)", "Real-ESRGAN (Custom)"
         ])
         self.model_selector.setMinimumWidth(180)
         base_layout.addWidget(self.model_selector)
@@ -632,6 +636,7 @@ class TrainingTab(QWidget):
         elif "SRCNN"  in model_text: model_abbr = "srcnn"
         elif "VDSR"   in model_text: model_abbr = "vdsr"
         elif "Swin"   in model_text: model_abbr = "swinir"
+        elif "Real-ESRGAN" in model_text: model_abbr = "esrgan"
         else:                        model_abbr = "model"
 
         loss_abbr = "mse" if ("MSE" in loss_text and "Hybrid" not in loss_text) else "hybrid"

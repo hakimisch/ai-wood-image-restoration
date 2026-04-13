@@ -13,7 +13,7 @@ from PyQt6.QtGui import QImage, QPixmap
 
 # AI/Machine Learning Imports
 try:
-    from models import SimpleRestorationNet, SRCNN, VDSR, SwinIR
+    from models import SimpleRestorationNet, SRCNN, VDSR, SwinIR, RRDBNet
     import torch
     AI_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):
@@ -88,6 +88,8 @@ class AIRestorationTab(QWidget):
                 self.model = VDSR()
             elif model_name == "SwinIR (Custom)":
                 self.model = SwinIR(img_size=128)
+            elif "Real-ESRGAN" in model_name:
+                self.model = RRDBNet()
             else:
                 self.rest_output_view.setText(f"{model_name} is not yet implemented.\nPlease select a valid model.")
                 self.rest_output_view.setStyleSheet("background: #ecf0f1; border: 3px dashed #e74c3c; color: #e74c3c;")
@@ -181,7 +183,7 @@ class AIRestorationTab(QWidget):
             "SRCNN (Custom)", 
             "VDSR (Custom)", 
             "SwinIR (Custom)", 
-            "Real-ESRGAN (Pre-trained)"
+            "Real-ESRGAN (Custom)"
         ])
         self.model_selector.currentTextChanged.connect(self.load_selected_model)
         engine_layout.addWidget(self.model_selector)
@@ -408,6 +410,8 @@ class AIRestorationTab(QWidget):
             # Determine tile size dynamically
             if "SwinIR" in self.model_selector.currentText():
                 t_size = 128
+            elif "Real-ESRGAN" in self.model_selector.currentText():
+                t_size = 96
             else:
                 t_size = 256
 
@@ -415,6 +419,23 @@ class AIRestorationTab(QWidget):
             t_start = time.perf_counter()
             restored_1x_bgr = self._process_in_patches(ai_ready_frame, tile_size=t_size)
             t_elapsed = time.perf_counter() - t_start
+
+            # ------------------------------------------------------------------
+            # NEW: Luminance Transfer (Fixes ESRGAN Color Drift / Chroma Noise)
+            # ------------------------------------------------------------------
+            # Convert both the original input and the AI output to YCrCb
+            orig_ycc = cv2.cvtColor(ai_ready_frame, cv2.COLOR_BGR2YCrCb)
+            ai_ycc   = cv2.cvtColor(restored_1x_bgr, cv2.COLOR_BGR2YCrCb)
+
+            # Swap the AI's hallucinated colors with the original pristine colors.
+            # Y (Index 0) = Luminance (Sharpness) -> Kept from AI
+            # Cr/Cb (Index 1 & 2) = Chrominance (Color) -> Replaced with Original
+            ai_ycc[:, :, 1] = orig_ycc[:, :, 1] 
+            ai_ycc[:, :, 2] = orig_ycc[:, :, 2]
+
+            # Convert back to standard BGR for the UI
+            restored_1x_bgr = cv2.cvtColor(ai_ycc, cv2.COLOR_YCrCb2BGR)
+            # ------------------------------------------------------------------
 
             # STEP 2: Upscale the Pristine AI Output (if requested)
             if scale_factor > 1:
