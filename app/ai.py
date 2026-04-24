@@ -10,6 +10,8 @@ import os
 import math
 import time
 import json
+import sys
+import re
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QMessageBox, QFileDialog, QGroupBox,
                              QComboBox, QRadioButton, QCheckBox)
@@ -67,6 +69,32 @@ class AIRestorationTab(QWidget):
 
     # ── Classifier Loading (for Restore + Classify) ────────────────────────
     DEFAULT_CLASSIFIER_WEIGHTS = "classifier_weights.pth"
+    CLASSIFIER_PTH_PATTERN = 'classifier'
+
+    # Model → keyword mapping for filtering restoration weights
+    MODEL_KEYWORDS = {
+        "Simple CNN (Custom)":   ["scnn", "s_cnn"],
+        "SRCNN (Custom)":        ["srcnn"],
+        "VDSR (Custom)":         ["vdsr"],
+        "SwinIR (Custom)":       ["swinir", "swin_ir"],
+        "Real-ESRGAN (Custom)":  ["esrgan"],
+    }
+
+    def refresh_classifier_pth_list(self):
+        """Scan root directory for classifier *.pth files and update the dropdown."""
+        current = self.classifier_pth_selector.currentText() if hasattr(self, 'classifier_pth_selector') else ""
+        self.classifier_pth_selector.blockSignals(True)
+        self.classifier_pth_selector.clear()
+
+        all_pth = [f for f in os.listdir('.') if f.endswith('.pth') and self.CLASSIFIER_PTH_PATTERN in f.lower()]
+        if not all_pth:
+            self.classifier_pth_selector.addItem("No classifier weights found")
+        else:
+            self.classifier_pth_selector.addItems(sorted(all_pth))
+
+        if current in all_pth:
+            self.classifier_pth_selector.setCurrentText(current)
+        self.classifier_pth_selector.blockSignals(False)
 
     def _load_classifier(self, weights_path=None):
         """Load the species classifier for post-restoration classification."""
@@ -74,7 +102,9 @@ class AIRestorationTab(QWidget):
             return
 
         if weights_path is None:
-            weights_path = self.DEFAULT_CLASSIFIER_WEIGHTS
+            weights_path = self.classifier_pth_selector.currentText() if hasattr(self, 'classifier_pth_selector') else self.DEFAULT_CLASSIFIER_WEIGHTS
+            if weights_path == "No classifier weights found" or not weights_path.endswith('.pth'):
+                weights_path = self.DEFAULT_CLASSIFIER_WEIGHTS
 
         if not os.path.exists(weights_path):
             print(f"⚠️ Classifier weights not found at '{weights_path}' — Restore+Classify disabled.")
@@ -107,23 +137,61 @@ class AIRestorationTab(QWidget):
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         return torch.from_numpy(img_rgb.transpose(2, 0, 1)).float() / 255.0
 
-    def refresh_pth_list(self):
-        """Scans the root directory for .pth files and updates the dropdown."""
+    def refresh_pth_list(self, model_name=None):
+        """Scans the root directory for .pth files matching the selected model.
+
+        Args:
+            model_name: If provided, only show weights matching this model.
+                        If None, uses the current model_selector selection.
+        """
+        if model_name is None and hasattr(self, 'model_selector'):
+            model_name = self.model_selector.currentText()
+
         current_selection = self.pth_selector.currentText()
         self.pth_selector.blockSignals(True)
         self.pth_selector.clear()
-        
-        pth_files = [f for f in os.listdir('.') if f.endswith('.pth')]
-        
-        if not pth_files:
-            self.pth_selector.addItem("No .pth files found")
+
+        # Get all .pth files, excluding classifier weights
+        all_pth = [f for f in os.listdir('.') if f.endswith('.pth') and self.CLASSIFIER_PTH_PATTERN not in f.lower()]
+
+        if model_name:
+            # Filter by model-specific keywords
+            keywords = self.MODEL_KEYWORDS.get(model_name, [])
+            if keywords:
+                filtered = []
+                for f in all_pth:
+                    f_lower = f.lower()
+                    if any(kw in f_lower for kw in keywords):
+                        filtered.append(f)
+                all_pth = filtered
+
+        if not all_pth:
+            placeholder = f"No {model_name.replace('(Custom)', '').strip()} weights found" if model_name else "No .pth files found"
+            self.pth_selector.addItem(placeholder)
         else:
-            self.pth_selector.addItems(pth_files)
-            
-        if current_selection in pth_files:
+            self.pth_selector.addItems(sorted(all_pth))
+
+        if current_selection in all_pth:
             self.pth_selector.setCurrentText(current_selection)
-            
+
         self.pth_selector.blockSignals(False)
+
+    def on_model_changed(self, model_name):
+        """Called when the model architecture selector changes.
+        Re-filters the PTH dropdown to show only matching weights,
+        then loads the first available weight file.
+        """
+        self.refresh_pth_list(model_name)
+        # Auto-select the first valid weight file if current selection is a placeholder
+        current = self.pth_selector.currentText()
+        if not current.endswith('.pth'):
+            # Try to find a matching weight
+            for i in range(self.pth_selector.count()):
+                item = self.pth_selector.itemText(i)
+                if item.endswith('.pth'):
+                    self.pth_selector.setCurrentText(item)
+                    break
+        self.load_selected_model()
 
     def load_selected_model(self, *args):
         """Loads the architecture from the Model selector and weights from the PTH selector."""
@@ -242,7 +310,7 @@ class AIRestorationTab(QWidget):
             "SwinIR (Custom)", 
             "Real-ESRGAN (Custom)"
         ])
-        self.model_selector.currentTextChanged.connect(self.load_selected_model)
+        self.model_selector.currentTextChanged.connect(self.on_model_changed)
         engine_layout.addWidget(self.model_selector)
         
         engine_layout.addWidget(QLabel("Scale:"))
@@ -255,7 +323,7 @@ class AIRestorationTab(QWidget):
         ])
         engine_layout.addWidget(self.scale_selector)
 
-        # --- NEW: PTH File Selector ---
+        # --- PTH File Selector (Restoration Weights) ---
         weights_layout = QHBoxLayout()
         weights_layout.addWidget(QLabel("Weights File:"))
         self.pth_selector = QComboBox()
@@ -267,11 +335,25 @@ class AIRestorationTab(QWidget):
         self.btn_refresh_pth.clicked.connect(self.refresh_pth_list)
         weights_layout.addWidget(self.btn_refresh_pth)
 
+        # ── Classifier weights selector (for Restore + Classify) ──────────
+        weights_layout.addSpacing(10)
+        weights_layout.addWidget(QLabel("Classifier:"))
+        self.classifier_pth_selector = QComboBox()
+        self.classifier_pth_selector.setMinimumWidth(180)
+        self.refresh_classifier_pth_list()
+        self.classifier_pth_selector.currentTextChanged.connect(self._load_classifier)
+        weights_layout.addWidget(self.classifier_pth_selector)
+
+        self.btn_refresh_clf_pth = QPushButton("🔄")
+        self.btn_refresh_clf_pth.setToolTip("Refresh classifier weights list")
+        self.btn_refresh_clf_pth.clicked.connect(self.refresh_classifier_pth_list)
+        weights_layout.addWidget(self.btn_refresh_clf_pth)
+
         self.btn_reload_classifier = QPushButton("🔬 Reload Classifier")
         self.btn_reload_classifier.clicked.connect(self._load_classifier)
         self.btn_reload_classifier.setToolTip("Reload classifier weights after training")
         weights_layout.addWidget(self.btn_reload_classifier)
-        # -------------------------------
+        # ───────────────────────────────────────────────────────────────────
 
         self.rest_output_view = QLabel("AI Restored Result\n(Awaiting Inference)")
         self.rest_output_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -315,17 +397,13 @@ class AIRestorationTab(QWidget):
             "font-size: 11px; color: #95a5a6;"
         )
 
-        if not self.classifier_loaded:
-            self.btn_restore_classify.setEnabled(False)
-            self.btn_restore_classify.setToolTip(
-                "Train the classifier first via Training > Classifier Training tab"
-            )
         # ────────────────────────────────────────────────────────────────────
 
         if not self.ai_available:
             self.btn_restore.setEnabled(False)
             self.model_selector.setEnabled(False)
             self.pth_selector.setEnabled(False)
+            self.classifier_pth_selector.setEnabled(False)
 
         right_layout.addLayout(engine_layout)
         right_layout.addLayout(weights_layout)

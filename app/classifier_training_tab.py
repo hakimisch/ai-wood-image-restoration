@@ -10,6 +10,7 @@
 
 import os
 import sys
+import re
 import sqlite3
 import random
 import numpy as np
@@ -39,6 +40,7 @@ from app.classifier import SpeciesClassifier, build_species_index
 KAYU_DIR = "Kayu"
 DB_PATH  = "data/database.db"
 DEFAULT_SAVE_PATH = "classifier_weights.pth"
+CLASSIFIER_PTH_PATTERN = 'classifier'
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +502,32 @@ class ClassifierTrainingTab(QWidget):
         super().__init__()
         self.setup_ui()
 
+    def _auto_generate_save_name(self):
+        """Generate a save name with consistent convention:
+        {epochs}e_{backbone}_classifier_{batch}batch_{id}.pth
+        Auto-increments the {id} based on existing files.
+        """
+        epochs = self.epoch_spinbox.value()
+        batch  = self.batch_spinbox.value()
+        backbone = "resnet18"
+        base = f"{epochs}e_{backbone}_classifier_{batch}batch"
+
+        # Find the next available ID
+        existing = [f for f in os.listdir('.') if f.endswith('.pth') and CLASSIFIER_PTH_PATTERN in f.lower()]
+        max_id = 0
+        for f in existing:
+            # Match pattern like "30e_resnet18_classifier_32batch_1.pth"
+            m = re.search(rf'{re.escape(base)}_(\d+)\.pth', f)
+            if m:
+                max_id = max(max_id, int(m.group(1)))
+        next_id = max_id + 1
+
+        return f"{base}_{next_id}.pth"
+
+    def _update_save_name(self):
+        """Auto-update the save name input when epochs/batch change."""
+        self.save_name_input.setText(self._auto_generate_save_name())
+
     def setup_ui(self):
         from PyQt6.QtWidgets import QRadioButton, QButtonGroup
 
@@ -617,7 +645,7 @@ class ClassifierTrainingTab(QWidget):
         save_layout = QHBoxLayout()
         save_layout.addWidget(QLabel("Save Weights As:"))
         self.save_name_input = QLineEdit()
-        self.save_name_input.setText(DEFAULT_SAVE_PATH)
+        self.save_name_input.setText(self._auto_generate_save_name())
         save_layout.addWidget(self.save_name_input, stretch=1)
         self.btn_train = QPushButton("\u25B6  START TRAINING")
         self.btn_train.setStyleSheet(
@@ -677,6 +705,8 @@ class ClassifierTrainingTab(QWidget):
         self.mode_group.idToggled.connect(self.on_mode_changed)
         self.accum_spinbox.valueChanged.connect(self.on_accum_changed)
         self.batch_spinbox.valueChanged.connect(self.on_accum_changed)
+        self.epoch_spinbox.valueChanged.connect(self._update_save_name)
+        self.batch_spinbox.valueChanged.connect(self._update_save_name)
 
         self.on_mode_changed()
 

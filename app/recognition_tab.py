@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QMessageBox, QFileDialog, QGroupBox, QComboBox, QProgressBar,
     QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, QSplitter,
-    QCheckBox, QSpinBox, QTabWidget,
+    QCheckBox, QSpinBox, QTabWidget, QRadioButton,
 )
 from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QFont
@@ -59,6 +59,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 DB_PATH = 'data/database.db'
 DEFAULT_WEIGHTS = 'classifier_weights.pth'
+CLASSIFIER_PTH_PATTERN = 'classifier'
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +256,7 @@ class RecognitionTab(QWidget):
         self.live_mode = True
         self.classifier = None
         self.classifier_loaded = False
+        self.use_grayscale = False  # Toggle for grayscale mode
 
         # Timing for live classification throttling
         self.last_classify_time = 0
@@ -265,6 +267,22 @@ class RecognitionTab(QWidget):
 
     # ── Classifier Loading ────────────────────────────────────────────────
 
+    def refresh_classifier_pth_list(self):
+        """Scan root directory for classifier *.pth files and update the dropdown."""
+        current = self.classifier_pth_selector.currentText()
+        self.classifier_pth_selector.blockSignals(True)
+        self.classifier_pth_selector.clear()
+
+        all_pth = [f for f in os.listdir('.') if f.endswith('.pth') and CLASSIFIER_PTH_PATTERN in f.lower()]
+        if not all_pth:
+            self.classifier_pth_selector.addItem("No classifier weights found")
+        else:
+            self.classifier_pth_selector.addItems(sorted(all_pth))
+
+        if current in all_pth:
+            self.classifier_pth_selector.setCurrentText(current)
+        self.classifier_pth_selector.blockSignals(False)
+
     def load_classifier(self, weights_path=None):
         """Attempt to load the classifier model."""
         if not CLASSIFIER_AVAILABLE:
@@ -272,13 +290,14 @@ class RecognitionTab(QWidget):
             return
 
         if weights_path is None:
-            weights_path = DEFAULT_WEIGHTS
+            weights_path = self.classifier_pth_selector.currentText()
+            if weights_path == "No classifier weights found" or not weights_path.endswith('.pth'):
+                weights_path = DEFAULT_WEIGHTS
 
         if not os.path.exists(weights_path):
             self.recog_status.setText(
                 f"⚠️ No weights found at '{weights_path}'\n"
-                "Train the classifier first via:\n"
-                "  python app/train_classifier.py"
+                "Train the classifier first via Training > Classifier Training tab"
             )
             self.classifier_loaded = False
             return
@@ -355,6 +374,16 @@ class RecognitionTab(QWidget):
         self.interval_spin.setSuffix("s")
         ctrl_row.addWidget(self.interval_spin)
 
+        # Grayscale toggle
+        ctrl_row.addSpacing(10)
+        ctrl_row.addWidget(QLabel("Mode:"))
+        self.radio_rgb = QRadioButton("RGB")
+        self.radio_gray = QRadioButton("Grayscale")
+        self.radio_rgb.setChecked(True)
+        self.radio_rgb.toggled.connect(lambda: setattr(self, 'use_grayscale', self.radio_gray.isChecked()))
+        ctrl_row.addWidget(self.radio_rgb)
+        ctrl_row.addWidget(self.radio_gray)
+
         self.btn_classify_now = QPushButton("🔍 Classify Now")
         self.btn_classify_now.clicked.connect(self.classify_current_frame)
         self.btn_classify_now.setStyleSheet(
@@ -417,6 +446,19 @@ class RecognitionTab(QWidget):
         self.recog_status.setStyleSheet("color: #7f8c8d; font-style: italic;")
         status_layout.addWidget(self.recog_status, stretch=1)
 
+        # Classifier weights selector
+        status_layout.addWidget(QLabel("Weights:"))
+        self.classifier_pth_selector = QComboBox()
+        self.classifier_pth_selector.setMinimumWidth(200)
+        self.refresh_classifier_pth_list()
+        self.classifier_pth_selector.currentTextChanged.connect(self.reload_classifier)
+        status_layout.addWidget(self.classifier_pth_selector)
+
+        self.btn_refresh_pth = QPushButton("🔄")
+        self.btn_refresh_pth.setToolTip("Refresh classifier weights list")
+        self.btn_refresh_pth.clicked.connect(self.refresh_classifier_pth_list)
+        status_layout.addWidget(self.btn_refresh_pth)
+
         self.btn_reload = QPushButton("🔄 Reload Classifier")
         self.btn_reload.clicked.connect(self.reload_classifier)
         status_layout.addWidget(self.btn_reload)
@@ -449,7 +491,13 @@ class RecognitionTab(QWidget):
     def _run_live_classification(self, frame):
         """Run classification on a frame and update the prediction labels."""
         try:
-            species, confidence, top3 = self.classifier.predict(frame, top_k=3)
+            # Apply grayscale conversion if selected
+            classify_frame = frame.copy()
+            if self.use_grayscale and len(classify_frame.shape) == 3:
+                gray = cv2.cvtColor(classify_frame, cv2.COLOR_BGR2GRAY)
+                classify_frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+            species, confidence, top3 = self.classifier.predict(classify_frame, top_k=3)
 
             self.pred_species_label.setText(f"Species: {species}")
             self.pred_confidence_label.setText(f"Confidence: {confidence:.1%}")
@@ -556,7 +604,11 @@ class RecognitionTab(QWidget):
 
     def reload_classifier(self):
         """Reload the classifier (e.g., after training new weights)."""
-        self.load_classifier()
+        weights_path = self.classifier_pth_selector.currentText()
+        if weights_path and weights_path.endswith('.pth'):
+            self.load_classifier(weights_path=weights_path)
+        else:
+            self.load_classifier()
 
     def _convert_cv_to_qpixmap(self, frame, label_width, label_height):
         if len(frame.shape) == 2:
