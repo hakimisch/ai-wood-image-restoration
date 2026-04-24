@@ -9,6 +9,7 @@ __pycache__/
 venv/
 .env
 
+plans/
 
 # Virtual Environments
 torch_env/
@@ -18,3 +19,6 @@ env/
 
 # Trained Models
 *.pth
+
+# Reports & Evaluation Outputs
+reports/

@@ -1,12 +1,17 @@
 # app/ai_tab.py
+#
+# AI Restoration Tab — also supports "Restore + Classify" pipeline:
+# after running restoration inference, the restored image is passed
+# through the species classifier (ResNet18) to measure downstream impact.
 
 import cv2
 import numpy as np
 import os
 import math
-import time 
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QPushButton, QMessageBox, QFileDialog, QGroupBox, 
+import time
+import json
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                             QPushButton, QMessageBox, QFileDialog, QGroupBox,
                              QComboBox, QRadioButton, QCheckBox)
 from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QImage, QPixmap
@@ -19,6 +24,17 @@ try:
 except (ImportError, ModuleNotFoundError):
     AI_AVAILABLE = False
     print("⚠️ AI modules not found. Restoration tab will be limited.")
+
+# Classifier import (optional — for Restore + Classify pipeline)
+try:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from app.classifier import create_classifier
+    CLASSIFIER_AVAILABLE = True
+except (ImportError, ModuleNotFoundError) as e:
+    CLASSIFIER_AVAILABLE = False
+    print(f"⚠️ Classifier module not found: {e}")
+
+import sys
 
 def calculate_vol(image):
     if len(image.shape) == 2:
@@ -40,9 +56,50 @@ class AIRestorationTab(QWidget):
         self.last_vol_time      = 0
         self.vol_update_interval = 0.05
 
+        # Classifier for Restore + Classify pipeline
+        self.classifier = None
+        self.classifier_loaded = False
+        self._load_classifier()
+
         # No PIL transform needed — _to_tensor() does it directly
         self.setup_ui()
         self.load_selected_model()
+
+    # ── Classifier Loading (for Restore + Classify) ────────────────────────
+    DEFAULT_CLASSIFIER_WEIGHTS = "classifier_weights.pth"
+
+    def _load_classifier(self, weights_path=None):
+        """Load the species classifier for post-restoration classification."""
+        if not CLASSIFIER_AVAILABLE:
+            return
+
+        if weights_path is None:
+            weights_path = self.DEFAULT_CLASSIFIER_WEIGHTS
+
+        if not os.path.exists(weights_path):
+            print(f"⚠️ Classifier weights not found at '{weights_path}' — Restore+Classify disabled.")
+            self.classifier_loaded = False
+            if hasattr(self, 'btn_restore_classify'):
+                self.btn_restore_classify.setEnabled(False)
+                self.btn_restore_classify.setToolTip(
+                    "Train the classifier first via Training > Classifier Training tab"
+                )
+            return
+
+        try:
+            self.classifier = create_classifier(weights_path=weights_path)
+            self.classifier_loaded = True
+            print(f"🔬 Classifier loaded for Restore+Classify ({self.classifier.num_species} species)")
+            if hasattr(self, 'btn_restore_classify'):
+                self.btn_restore_classify.setEnabled(True)
+                self.btn_restore_classify.setToolTip(
+                    "Run restoration then classify the restored output"
+                )
+        except Exception as e:
+            print(f"⚠️ Failed to load classifier: {e}")
+            self.classifier_loaded = False
+            if hasattr(self, 'btn_restore_classify'):
+                self.btn_restore_classify.setEnabled(False)
 
     @staticmethod
     def _to_tensor(img_bgr):
@@ -209,6 +266,11 @@ class AIRestorationTab(QWidget):
         self.btn_refresh_pth = QPushButton("🔄 Refresh")
         self.btn_refresh_pth.clicked.connect(self.refresh_pth_list)
         weights_layout.addWidget(self.btn_refresh_pth)
+
+        self.btn_reload_classifier = QPushButton("🔬 Reload Classifier")
+        self.btn_reload_classifier.clicked.connect(self._load_classifier)
+        self.btn_reload_classifier.setToolTip("Reload classifier weights after training")
+        weights_layout.addWidget(self.btn_reload_classifier)
         # -------------------------------
 
         self.rest_output_view = QLabel("AI Restored Result\n(Awaiting Inference)")
@@ -232,7 +294,34 @@ class AIRestorationTab(QWidget):
         self.btn_restore.setMinimumHeight(50)
         self.btn_restore.setStyleSheet("background-color: #2980b9; color: white; font-weight: bold; font-size: 14px;")
         self.btn_restore.clicked.connect(self.run_inference)
-        
+
+        # ── Restore + Classify pipeline ────────────────────────────────────
+        self.btn_restore_classify = QPushButton("🔬 RESTORE + CLASSIFY")
+        self.btn_restore_classify.setMinimumHeight(50)
+        self.btn_restore_classify.setStyleSheet(
+            "background-color: #8e44ad; color: white; font-weight: bold; font-size: 14px;"
+        )
+        self.btn_restore_classify.clicked.connect(self.run_restore_and_classify)
+
+        # Classification result display
+        self.classify_result_label = QLabel("")
+        self.classify_result_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.classify_result_label.setStyleSheet(
+            "font-size: 14px; color: #7f8c8d; font-style: italic; padding: 4px;"
+        )
+        self.classify_top3_label = QLabel("")
+        self.classify_top3_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.classify_top3_label.setStyleSheet(
+            "font-size: 11px; color: #95a5a6;"
+        )
+
+        if not self.classifier_loaded:
+            self.btn_restore_classify.setEnabled(False)
+            self.btn_restore_classify.setToolTip(
+                "Train the classifier first via Training > Classifier Training tab"
+            )
+        # ────────────────────────────────────────────────────────────────────
+
         if not self.ai_available:
             self.btn_restore.setEnabled(False)
             self.model_selector.setEnabled(False)
@@ -245,6 +334,9 @@ class AIRestorationTab(QWidget):
         right_layout.addWidget(self.vol_delta_lbl)
         right_layout.addWidget(self.inference_time_lbl)
         right_layout.addWidget(self.btn_restore)
+        right_layout.addWidget(self.btn_restore_classify)
+        right_layout.addWidget(self.classify_result_label)
+        right_layout.addWidget(self.classify_top3_label)
         output_group.setLayout(right_layout)
         
         main_layout.addWidget(input_group, stretch=1)
@@ -290,19 +382,23 @@ class AIRestorationTab(QWidget):
         if file_name:
             img = cv2.imread(file_name)
             if img is not None:
-                self.live_mode = False 
+                self.live_mode = False
                 self.current_frame = img
-                self.update_static_preview() 
+                self.update_static_preview()
                 self.rest_output_view.setText("Ready for Processing...")
                 self.rest_output_view.setStyleSheet("background: #ecf0f1; border: 3px solid #f1c40f;")
                 self.output_vol_lbl.setText("Output VOL: --")
+                self.classify_result_label.setText("")
+                self.classify_top3_label.setText("")
 
     def resume_live(self):
         self.live_mode = True
-        self.load_selected_model() 
+        self.load_selected_model()
         self.input_vol_lbl.setText("Input VOL: -- (Live Feed)")
-        self.input_vol_lbl.setStyleSheet("font-weight: bold; color: blue;") 
+        self.input_vol_lbl.setStyleSheet("font-weight: bold; color: blue;")
         self.output_vol_lbl.setText("Output VOL: --")
+        self.classify_result_label.setText("")
+        self.classify_top3_label.setText("")
 
     def _process_in_patches(self, img_bgr, tile_size=256):
         """Tile with overlap and blend to eliminate seam artifacts at tile boundaries.
@@ -486,6 +582,141 @@ class AIRestorationTab(QWidget):
                 QMessageBox.warning(self, "GPU Memory Error", "Image too large for the GTX 1660 Ti!\nTry a smaller scale.")
             else:
                 QMessageBox.critical(self, "AI Error", f"Inference failed: {str(e)}")
+
+    # ── Restore + Classify Pipeline ────────────────────────────────────────
+
+    def run_restore_and_classify(self):
+        """Run restoration inference, then classify the restored output.
+
+        This implements the thesis experiment:
+            Blurry Input → SwinIR Restore → ResNet18 Classify
+        and compares the result against classifying the un-restored input.
+        """
+        if self.current_frame is None or not self.ai_available:
+            return
+        if getattr(self, 'model', None) is None:
+            QMessageBox.warning(self, "No Model", "Load a restoration model first.")
+            return
+        if not self.classifier_loaded:
+            QMessageBox.warning(
+                self, "No Classifier",
+                "Classifier not loaded.\nTrain one in Training > Classifier Training tab."
+            )
+            return
+
+        try:
+            display_frame = self.get_display_frame()
+
+            if len(display_frame.shape) == 2:
+                ai_ready_frame = cv2.cvtColor(display_frame, cv2.COLOR_GRAY2BGR)
+            else:
+                ai_ready_frame = display_frame
+
+            # ── Step 1: Classify the UN-restored input (baseline) ────────
+            raw_species, raw_confidence, raw_top3 = self.classifier.predict(
+                ai_ready_frame, top_k=3
+            )
+
+            # ── Step 2: Run restoration ──────────────────────────────────
+            scale_text = self.scale_selector.currentText()
+            if   "1x" in scale_text: scale_factor = 1
+            elif "2x" in scale_text: scale_factor = 2
+            elif "3x" in scale_text: scale_factor = 3
+            elif "4x" in scale_text: scale_factor = 4
+            else:                    scale_factor = 1
+
+            if "SwinIR" in self.model_selector.currentText():
+                t_size = 128
+            elif "Real-ESRGAN" in self.model_selector.currentText():
+                t_size = 96
+            else:
+                t_size = 256
+
+            self.rest_output_view.setText("Restoring + Classifying...\n(This may take a moment)")
+            self.rest_output_view.repaint()
+
+            t_start = time.perf_counter()
+            restored_bgr = self._process_in_patches(ai_ready_frame, tile_size=t_size)
+            t_elapsed = time.perf_counter() - t_start
+
+            # Luminance transfer (same as run_inference)
+            orig_ycc = cv2.cvtColor(ai_ready_frame, cv2.COLOR_BGR2YCrCb)
+            ai_ycc   = cv2.cvtColor(restored_bgr, cv2.COLOR_BGR2YCrCb)
+            ai_ycc[:, :, 1] = orig_ycc[:, :, 1]
+            ai_ycc[:, :, 2] = orig_ycc[:, :, 2]
+            restored_bgr = cv2.cvtColor(ai_ycc, cv2.COLOR_YCrCb2BGR)
+
+            if scale_factor > 1:
+                orig_h, orig_w = restored_bgr.shape[:2]
+                final_output_bgr = cv2.resize(
+                    restored_bgr,
+                    (orig_w * scale_factor, orig_h * scale_factor),
+                    interpolation=cv2.INTER_LANCZOS4
+                )
+            else:
+                final_output_bgr = restored_bgr
+
+            # ── Step 3: Classify the RESTORED output ─────────────────────
+            restored_species, restored_confidence, restored_top3 = self.classifier.predict(
+                final_output_bgr, top_k=3
+            )
+
+            # ── Step 4: Display results ──────────────────────────────────
+            vol_in  = calculate_vol(ai_ready_frame)
+            vol_out = calculate_vol(final_output_bgr)
+            delta   = vol_out - vol_in
+            sign    = "+" if delta >= 0 else ""
+
+            self.input_vol_lbl.setText(f"Input VOL: {vol_in:.1f}")
+            self.output_vol_lbl.setText(f"Output VOL: {vol_out:.1f} ({scale_factor}x)")
+            self.vol_delta_lbl.setText(f"VOL gain: {sign}{delta:.1f}")
+            self.inference_time_lbl.setText(
+                f"Inference: {t_elapsed:.2f}s  |  Device: {self.device}"
+            )
+
+            # Classification comparison
+            raw_top3_str = " | ".join([f"{s}: {c:.0%}" for s, c in raw_top3])
+            rest_top3_str = " | ".join([f"{s}: {c:.0%}" for s, c in restored_top3])
+
+            self.classify_result_label.setText(
+                f"🔬 Before: {raw_species} ({raw_confidence:.1%})  →  "
+                f"After Restore: {restored_species} ({restored_confidence:.1%})"
+            )
+
+            # Color-code: green if restored improved or matches, red if worse
+            if restored_confidence >= raw_confidence:
+                self.classify_result_label.setStyleSheet(
+                    "font-size: 15px; font-weight: bold; color: #27ae60; padding: 4px;"
+                )
+            else:
+                self.classify_result_label.setStyleSheet(
+                    "font-size: 15px; font-weight: bold; color: #e67e22; padding: 4px;"
+                )
+
+            self.classify_top3_label.setText(
+                f"Before Top-3: {raw_top3_str}  |  "
+                f"After Top-3: {rest_top3_str}"
+            )
+            self.classify_top3_label.setStyleSheet(
+                "font-size: 11px; color: #7f8c8d;"
+            )
+
+            # Show restored image in output view
+            pix = self._convert_cv_to_qpixmap(
+                final_output_bgr, self.rest_output_view.width(), self.rest_output_view.height()
+            )
+            self.rest_output_view.setPixmap(pix)
+            self.rest_output_view.setStyleSheet("border: 3px solid #8e44ad;")
+
+        except Exception as e:
+            if "CUDA out of memory" in str(e):
+                QMessageBox.warning(self, "GPU Memory Error",
+                                    "Image too large for the GTX 1660 Ti!\nTry a smaller scale.")
+            else:
+                QMessageBox.critical(self, "Pipeline Error",
+                                     f"Restore + Classify failed:\n{str(e)}")
+                import traceback
+                traceback.print_exc()
 
     def _convert_cv_to_qpixmap(self, frame, label_width, label_height):
         if len(frame.shape) == 2:

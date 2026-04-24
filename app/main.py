@@ -20,6 +20,8 @@ from PyQt6.QtGui import QImage, QPixmap
 from camera_thread import CameraThread
 from ai import AIRestorationTab  # NEW: Import the extracted AI Tab
 from training_tab import TrainingTab # NEW: Import the Training Tab
+from classifier_training_tab import ClassifierTrainingTab # NEW: Import the Classifier Training Tab
+from recognition_tab import RecognitionTab # NEW: Import the Recognition Tab
 
 def calculate_vol(image):
     """Calculates the Variance of Laplacian (Sharpness Score)[cite: 20]."""
@@ -52,12 +54,27 @@ class MicroscopeApp(QMainWindow):
         self.tabs.addTab(self.acq_tab, "📸 Data Acquisition")
 
         # --- Tab 2: Training & Analytics (NEW) ---
-        self.train_tab = TrainingTab()
+        # Nested sub-tabs: Restoration Training + Classifier Training
+        self.train_tab = QWidget()
+        self.train_sub_tabs = QTabWidget()
+        self.train_sub_tabs.setDocumentMode(True)
+        self.restore_train_tab = TrainingTab()
+        self.classifier_train_tab = ClassifierTrainingTab()
+        self.train_sub_tabs.addTab(self.restore_train_tab, "🖼️ Restoration Training")
+        self.train_sub_tabs.addTab(self.classifier_train_tab, "🔬 Classifier Training")
+        train_layout = QVBoxLayout()
+        train_layout.setContentsMargins(0, 0, 0, 0)
+        train_layout.addWidget(self.train_sub_tabs)
+        self.train_tab.setLayout(train_layout)
         self.tabs.addTab(self.train_tab, "📈 Training & Analytics")
 
         # --- Tab 3: AI Restoration (Now an imported Module) ---
         self.rest_tab = AIRestorationTab()
         self.tabs.addTab(self.rest_tab, "⚡ AI Restoration")
+
+        # --- Tab 4: Species Recognition (NEW) ---
+        self.recog_tab = RecognitionTab()
+        self.tabs.addTab(self.recog_tab, "🔬 Species Recognition")
 
         # 3. Global Threading and Camera Setup [cite: 43]
         self.thread = CameraThread() 
@@ -207,17 +224,20 @@ class MicroscopeApp(QMainWindow):
         # Update Restoration Tab Live Feed
         self.rest_tab.update_live_feed(frame)
 
+        # Update Recognition Tab Live Feed
+        self.recog_tab.update_live_feed(frame)
+
     def save_sample(self):
         """Saves pairs and logs to DB[cite: 38]."""
         try:
-            # Note: We now pull the frame directly from the UI since self.current_frame 
+            # Note: We now pull the frame directly from the UI since self.current_frame
             # is no longer saved as an instance variable in main.py to save memory.
             # We can grab the frame directly from the camera thread's current state if needed,
             # but for simplicity, we rely on the threaded live feed.
             if self.thread.frame is None: return
             frame_to_save = self.thread.frame.copy()
             
-            self.refresh_species_glossary() 
+            self.refresh_species_glossary()
             
             # 1. Species Parsing
             full_input = self.block_name_input.text().strip().upper()
@@ -230,7 +250,7 @@ class MicroscopeApp(QMainWindow):
             species_name = self.species_glossary.get(initials, "Unknown")
             
             if species_name == "Unknown":
-                QMessageBox.critical(self, "Species Error", 
+                QMessageBox.critical(self, "Species Error",
                                      f"Could not identify species for '{full_input}'.\n"
                                      "Please register the species initials first.")
                 return
@@ -271,13 +291,41 @@ class MicroscopeApp(QMainWindow):
 
             # 6. Database Logging [cite: 102]
             with sqlite3.connect('data/database.db') as conn:
-                conn.execute('''INSERT OR REPLACE INTO samples 
-                    (species_name, species_initials, sample_name, mode, 
+                conn.execute('''INSERT OR REPLACE INTO samples
+                    (species_name, species_initials, sample_name, mode,
                      clear_path, blur_path, vol_clear, vol_blur, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
-                 (species_name, initials, image_id, mode, cp, bp, 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                 (species_name, initials, image_id, mode, cp, bp,
                   v_clear, v_blur, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                 conn.commit()
+
+            # ── 7. Auto-Classification Verification (NEW) ─────────────────
+            # If the classifier is loaded, verify the captured species matches
+            if hasattr(self, 'recog_tab') and self.recog_tab.classifier_loaded:
+                try:
+                    clf = self.recog_tab.classifier
+                    pred_species, confidence, top3 = clf.predict(frame_to_save, top_k=3)
+                    
+                    # Check if prediction matches expected species
+                    if pred_species != species_name:
+                        print(f"⚠️  Species Mismatch! Expected: {species_name}, "
+                              f"AI predicts: {pred_species} ({confidence:.1%})")
+                        # Still save the classification result to DB
+                        import json
+                        with sqlite3.connect('data/database.db') as conn:
+                            conn.execute(
+                                "INSERT INTO classifications "
+                                "(sample_name, predicted_species, confidence, top3_predictions, model_name, timestamp) "
+                                "VALUES (?, ?, ?, ?, ?, ?)",
+                                (image_id, pred_species, confidence,
+                                 json.dumps([{"species": s, "confidence": c} for s, c in top3]),
+                                 "ResNet18",
+                                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                            )
+                            conn.commit()
+                except Exception as e:
+                    print(f"⚠️  Auto-classification failed: {e}")
+            # ──────────────────────────────────────────────────────────────
 
             print(f"✅ Saved and Logged: {image_id} to {block_dir}")
             self.sub_image_count += 1
@@ -293,12 +341,42 @@ class MicroscopeApp(QMainWindow):
     def init_db(self):
         os.makedirs("data", exist_ok=True)
         with sqlite3.connect('data/database.db') as conn:
-            conn.execute('''CREATE TABLE IF NOT EXISTS samples 
+            conn.execute('''CREATE TABLE IF NOT EXISTS samples
                         (id INTEGER PRIMARY KEY, species_name TEXT, species_initials TEXT,
                          sample_name TEXT UNIQUE, mode TEXT, clear_path TEXT, blur_path TEXT,
                          vol_clear REAL, vol_blur REAL, timestamp TEXT)''')
-            conn.execute('''CREATE TABLE IF NOT EXISTS species_registry 
+            conn.execute('''CREATE TABLE IF NOT EXISTS species_registry
                         (initials TEXT PRIMARY KEY, full_name TEXT, scientific_name TEXT)''')
+            # --- Classification tables (added by recognition pipeline) ---
+            conn.execute('''CREATE TABLE IF NOT EXISTS classifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sample_name TEXT,
+                predicted_species TEXT,
+                confidence REAL,
+                top3_predictions TEXT,
+                model_name TEXT,
+                timestamp TEXT
+            )''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS species_stats (
+                species_name TEXT PRIMARY KEY,
+                total_images INTEGER DEFAULT 0,
+                avg_vol_clear REAL DEFAULT 0.0,
+                avg_vol_blur REAL DEFAULT 0.0,
+                classification_accuracy REAL DEFAULT 0.0,
+                last_updated TEXT
+            )''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS classifier_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_name TEXT,
+                num_species INTEGER,
+                epochs INTEGER,
+                batch_size INTEGER,
+                learning_rate REAL,
+                freeze_backbone INTEGER,
+                best_val_acc REAL,
+                best_epoch INTEGER,
+                timestamp TEXT
+            )''')
         self.refresh_species_glossary()
 
     def refresh_species_glossary(self):
