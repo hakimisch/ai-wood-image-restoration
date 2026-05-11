@@ -23,6 +23,14 @@ import random
 from datetime import datetime
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
+
+# LPIPS perceptual metric (optional — gracefully degrades if package missing)
+try:
+    import lpips
+    LPIPS_AVAILABLE = True
+except ImportError:
+    LPIPS_AVAILABLE = False
+    print("⚠️ lpips not installed. Perceptual metric disabled. Run: pip install lpips")
  
 from models import SimpleRestorationNet, SRCNN, VDSR, SwinIR, RRDBNet
  
@@ -152,7 +160,7 @@ class WoodDataset(Dataset):
 class AITrainingThread(QThread):
     log_signal      = pyqtSignal(str)
     progress_signal = pyqtSignal(int)
-    metrics_signal  = pyqtSignal(float, float)
+    metrics_signal  = pyqtSignal(float, float, float)
     finished_signal = pyqtSignal()
  
     def __init__(self, model_name, epochs, batch_size, loss_type, save_name, use_amp, accum_steps, lr):
@@ -353,6 +361,9 @@ class AITrainingThread(QThread):
                 transforms.CenterCrop(crop_size),
                 transforms.ToTensor(),
             ])
+
+            total_lpips = 0.0
+            lpips_fn = lpips.LPIPS(net='alex').to(device) if LPIPS_AVAILABLE else None
  
             total_psnr = total_ssim_val = 0.0
             with torch.no_grad():
@@ -371,24 +382,32 @@ class AITrainingThread(QThread):
                     total_psnr     += psnr(clear_np, out_np, data_range=255)
                     total_ssim_val += ssim(clear_np, out_np, data_range=255, channel_axis=-1, win_size=3)
  
+                    if LPIPS_AVAILABLE and lpips_fn is not None:
+                        clear_tensor_4d = clear_tensor.unsqueeze(0).to(device)
+                        lpips_val = lpips_fn(out_tensor, clear_tensor_4d).item()
+                        total_lpips += lpips_val
             n_eval   = max(len(test_pairs), 1)   # guard against empty list
             avg_psnr = total_psnr     / n_eval
             avg_ssim = total_ssim_val / n_eval
             self.log_signal.emit(f"📈 Holdout PSNR: {avg_psnr:.2f} dB | SSIM: {avg_ssim:.4f}")
-            self.metrics_signal.emit(avg_psnr, avg_ssim)
+            avg_lpips = total_lpips / n_eval if LPIPS_AVAILABLE else 0.0
+            lpips_str = f" | LPIPS: {avg_lpips:.4f}" if LPIPS_AVAILABLE else ""
+            self.log_signal.emit(f"📈 Holdout PSNR: {avg_psnr:.2f} dB | SSIM: {avg_ssim:.4f}{lpips_str}")
+            self.metrics_signal.emit(avg_psnr, avg_ssim, avg_lpips)
  
             # Save metrics to DB
             conn = sqlite3.connect('data/database.db')
             conn.execute('''CREATE TABLE IF NOT EXISTS model_metrics
                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
                  model_name TEXT, epochs INTEGER, batch_size INTEGER,
-                 final_loss REAL, psnr REAL, ssim REAL, timestamp TEXT,
+                 final_loss REAL, psnr REAL, ssim REAL, lpips REAL, timestamp TEXT,
                  pth_filename TEXT, loss_type TEXT, accum_steps INTEGER)''')
             # Add new columns gracefully if DB was created by an older version
             for col, typedef in [
                 ("pth_filename", "TEXT"),
                 ("loss_type",    "TEXT"),
                 ("accum_steps",  "INTEGER"),
+                ("lpips",        "REAL"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE model_metrics ADD COLUMN {col} {typedef}")
@@ -396,15 +415,16 @@ class AITrainingThread(QThread):
                     pass  # column already exists
             conn.execute(
                 "INSERT INTO model_metrics "
-                "(model_name, epochs, batch_size, final_loss, psnr, ssim, "
+                "(model_name, epochs, batch_size, final_loss, psnr, ssim, lpips, "
                 " timestamp, pth_filename, loss_type, accum_steps) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (self.model_name, self.epochs, self.batch_size,
                  avg_loss, avg_psnr, avg_ssim,
                  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                  os.path.basename(save_path),
                  self.loss_type,
-                 self.accum_steps)
+                 self.accum_steps,
+                 avg_lpips)
             )
             conn.commit()
             conn.close()
@@ -572,8 +592,12 @@ class TrainingTab(QWidget):
         self.ssim_label = QLabel("SSIM: --")
         self.ssim_label.setStyleSheet("font-size: 18px; color: #8e44ad;")
         self.ssim_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lpips_label = QLabel("LPIPS: --")
+        self.lpips_label.setStyleSheet("font-size: 18px; color: #e67e22;")
+        self.lpips_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         metrics_layout.addWidget(self.psnr_label)
         metrics_layout.addWidget(self.ssim_label)
+        metrics_layout.addWidget(self.lpips_label)
         metrics_group.setLayout(metrics_layout)
 
         layout.addWidget(base_group)
@@ -664,6 +688,8 @@ class TrainingTab(QWidget):
         self.progress_bar.setValue(0)
         self.psnr_label.setText("PSNR: Calculating...")
         self.ssim_label.setText("SSIM: Calculating...")
+        if hasattr(self, 'lpips_label'):
+            self.lpips_label.setText("LPIPS: Calculating...")
 
         save_name = self.save_name_input.text().strip()
         if not save_name.endswith(".pth"):
@@ -696,9 +722,11 @@ class TrainingTab(QWidget):
             self.console_output.verticalScrollBar().maximum()
         )
 
-    def update_metrics(self, psnr_val, ssim_val):
+    def update_metrics(self, psnr_val, ssim_val, lpips_val):
         self.psnr_label.setText(f"PSNR: {psnr_val:.2f} dB")
         self.ssim_label.setText(f"SSIM: {ssim_val:.4f}")
+        if hasattr(self, 'lpips_label'):
+            self.lpips_label.setText(f"LPIPS: {lpips_val:.4f}")
 
     def training_finished(self):
         self.btn_train.setEnabled(True)

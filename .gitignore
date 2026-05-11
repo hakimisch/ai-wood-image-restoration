@@ -1,6 +1,5 @@
 # Ignore the actual image data
 Kayu/
-data/database.db
 data/
 
 # Ignore Python artifacts
@@ -9,6 +8,7 @@ __pycache__/
 venv/
 .env
 
+# Execution plans
 plans/
 
 # Virtual Environments
@@ -22,3 +22,15 @@ env/
 
 # Reports & Evaluation Outputs
 reports/
+
+# Generated artifacts from model inference & evaluation
+outputs/
+eval_results/
+classifications_export.csv
+
+# Generated pandoc conversions from thesis draft
+research/
+
+# Old/backup draft versions — the canonical source is research_paper_draft.md
+research/research_paper_draft v*.md
+research/research_paper_convertible.md

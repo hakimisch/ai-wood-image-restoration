@@ -1,0 +1,3 @@
+method,psnr,ssim,lpips
+Wiener,3.56,0.0065,0.8322
+Richardson-Lucy,3.56,0.0063,0.8322
