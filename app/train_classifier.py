@@ -1,11 +1,13 @@
 # app/train_classifier.py
 #
 # Training script for the Species Classifier.
-# Reads clear images from Kayu/ directory structure, trains a ResNet18
-# via transfer learning, and saves weights to classifier_weights.pth.
+# Reads clear images from Kayu/ directory structure, trains a classifier
+# via transfer learning, and saves weights to disk.
 #
 # Usage:
-#   python app/train_classifier.py --epochs 30 --batch_size 32 --lr 1e-4
+#   python app/train_classifier.py --backbone resnet18 --epochs 30 --batch_size 32 --lr 1e-4
+#   python app/train_classifier.py --backbone resnet50 --epochs 30 --batch_size 32 --lr 1e-4
+#   python app/train_classifier.py --backbone swin_t --epochs 30 --batch_size 32 --lr 1e-4
 #
 # The script automatically:
 #   - Reads species from the DB registry
@@ -30,7 +32,7 @@ from torchvision import transforms
 
 # Add parent directory to path so we can import classifier
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from app.classifier import SpeciesClassifier, build_species_index
+from app.classifier import SpeciesClassifier, build_species_index, VALID_BACKBONES
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -66,7 +68,7 @@ class WoodClassificationDataset(Dataset):
         # Build species index from DB
         self.idx_to_name, self.name_to_idx = build_species_index(db_path)
         self.num_species = len(self.idx_to_name)
-        print(f"📋 Species registry loaded: {self.num_species} species")
+        print(f"\U0001f4cb Species registry loaded: {self.num_species} species")
 
         # Collect all image paths with their species labels
         all_samples = []  # list of (image_path, label_index)
@@ -99,7 +101,7 @@ class WoodClassificationDataset(Dataset):
                     all_samples.append((img_path, label))
 
         if skipped_species:
-            print(f"⚠️  Skipped {len(skipped_species)} folders not in registry: {skipped_species}")
+            print(f"\u26a0\ufe0f  Skipped {len(skipped_species)} folders not in registry: {skipped_species}")
 
         if not all_samples:
             raise RuntimeError(
@@ -107,7 +109,7 @@ class WoodClassificationDataset(Dataset):
                 "and contains species subfolders with clear/ subdirectories."
             )
 
-        print(f"📦 Total images found: {len(all_samples)}")
+        print(f"\U0001f4e6 Total images found: {len(all_samples)}")
 
         # Stratified train/val split
         rng = random.Random(seed)
@@ -130,7 +132,7 @@ class WoodClassificationDataset(Dataset):
             self.samples = val_samples
 
         rng.shuffle(self.samples)
-        print(f"📊 Split '{split}': {len(self.samples)} images")
+        print(f"\U0001f4ca Split '{split}': {len(self.samples)} images")
 
         # ImageNet normalization
         self.normalize = transforms.Normalize(
@@ -200,7 +202,7 @@ class WoodClassificationDataset(Dataset):
 
 def train_classifier(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🚀 Training on device: {device}")
+    print(f"\U0001f680 Training on device: {device}")
 
     # Reproducibility
     torch.manual_seed(42)
@@ -246,8 +248,11 @@ def train_classifier(args):
     model = SpeciesClassifier(
         num_species=train_dataset.num_species,
         freeze_backbone=not args.unfreeze,
+        backbone_name=args.backbone,
     )
     model = model.to(device)
+    model.idx_to_name = train_dataset.idx_to_name
+    model.name_to_idx = train_dataset.name_to_idx
 
     # Loss & Optimizer
     criterion = nn.CrossEntropyLoss()
@@ -261,7 +266,7 @@ def train_classifier(args):
     )
 
     print(f"\n{'='*60}")
-    print(f"Model: ResNet18 | Species: {model.num_species}")
+    print(f"Model: {args.backbone} | Species: {model.num_species}")
     print(f"Epochs: {args.epochs} | Batch: {args.batch_size} | LR: {args.lr}")
     print(f"Freeze backbone: {not args.unfreeze}")
     print(f"Train samples: {len(train_dataset)} | Val samples: {len(val_dataset)}")
@@ -320,7 +325,7 @@ def train_classifier(args):
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
-        print(f"\n📊 Epoch {epoch+1}/{args.epochs} — "
+        print(f"\n\U0001f4ca Epoch {epoch+1}/{args.epochs} \u2014 "
               f"Train Loss: {train_loss:.4f} Acc: {train_acc:.2f}% | "
               f"Val Loss: {val_loss:.4f} Acc: {val_acc:.2f}% | "
               f"LR: {current_lr:.6f}")
@@ -330,12 +335,12 @@ def train_classifier(args):
             best_val_acc = val_acc
             best_epoch = epoch + 1
             model.save_weights(args.save_path)
-            print(f"🌟 New best validation accuracy: {best_val_acc:.2f}% (epoch {best_epoch})")
+            print(f"\U0001f31f New best validation accuracy: {best_val_acc:.2f}% (epoch {best_epoch})")
 
         print()
 
     print(f"\n{'='*60}")
-    print(f"🎉 Training complete!")
+    print(f"\U0001f389 Training complete!")
     print(f"Best validation accuracy: {best_val_acc:.2f}% (epoch {best_epoch})")
     print(f"Weights saved to: {args.save_path}")
     print(f"{'='*60}")
@@ -346,6 +351,7 @@ def train_classifier(args):
         conn.execute('''CREATE TABLE IF NOT EXISTS classifier_metrics (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             model_name TEXT,
+            backbone_name TEXT,
             num_species INTEGER,
             epochs INTEGER,
             batch_size INTEGER,
@@ -357,18 +363,18 @@ def train_classifier(args):
         )''')
         conn.execute(
             "INSERT INTO classifier_metrics "
-            "(model_name, num_species, epochs, batch_size, learning_rate, "
+            "(model_name, backbone_name, num_species, epochs, batch_size, learning_rate, "
             " freeze_backbone, best_val_acc, best_epoch, timestamp) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("ResNet18", model.num_species, args.epochs, args.batch_size,
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (args.backbone, args.backbone, model.num_species, args.epochs, args.batch_size,
              args.lr, int(not args.unfreeze), best_val_acc, best_epoch,
              datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         )
         conn.commit()
         conn.close()
-        print("💾 Training metrics saved to database.")
+        print("\U0001f4be Training metrics saved to database.")
     except Exception as e:
-        print(f"⚠️  Could not save metrics to DB: {e}")
+        print(f"\u26a0\ufe0f  Could not save metrics to DB: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -377,8 +383,11 @@ def train_classifier(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train ResNet18 species classifier on Kayu wood dataset."
+        description="Train a species classifier on Kayu wood dataset."
     )
+    parser.add_argument("--backbone", type=str, default="resnet18",
+                        choices=sorted(VALID_BACKBONES),
+                        help=f"Backbone architecture: {sorted(VALID_BACKBONES)} (default: resnet18)")
     parser.add_argument("--epochs", "-e", type=int, default=30,
                         help="Number of training epochs (default: 30)")
     parser.add_argument("--batch_size", "-b", type=int, default=32,
@@ -392,6 +401,11 @@ def main():
     parser.add_argument("--unfreeze", "-u", action="store_true",
                         help="Unfreeze backbone for full fine-tuning")
     args = parser.parse_args()
+
+    # Build default save path if not specified
+    if args.save_path == DEFAULT_SAVE_PATH:
+        freeze_str = "unfrozen" if args.unfreeze else "frozen"
+        args.save_path = f"{args.epochs}e_{args.backbone}_{freeze_str}_{args.batch_size}batch_{args.lr}.pth"
 
     train_classifier(args)
 

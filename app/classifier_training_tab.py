@@ -10,7 +10,6 @@
 
 import os
 import sys
-import re
 import sqlite3
 import random
 import numpy as np
@@ -31,7 +30,7 @@ from torchvision import transforms
 
 # Add parent directory to path so we can import classifier
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from app.classifier import SpeciesClassifier, build_species_index
+from app.classifier import SpeciesClassifier, build_species_index, VALID_BACKBONES
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +39,6 @@ from app.classifier import SpeciesClassifier, build_species_index
 KAYU_DIR = "Kayu"
 DB_PATH  = "data/database.db"
 DEFAULT_SAVE_PATH = "classifier_weights.pth"
-CLASSIFIER_PTH_PATTERN = 'classifier'
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +210,7 @@ class ClassifierTrainingThread(QThread):
     finished_signal = pyqtSignal()
 
     def __init__(self, epochs, batch_size, lr, save_name, use_amp,
-                 accum_steps, freeze_backbone):
+                 accum_steps, freeze_backbone, backbone_name='resnet18'):
         super().__init__()
         self.epochs         = epochs
         self.batch_size     = batch_size
@@ -221,6 +219,7 @@ class ClassifierTrainingThread(QThread):
         self.use_amp        = use_amp
         self.accum_steps    = accum_steps
         self.freeze_backbone = freeze_backbone
+        self.backbone_name  = backbone_name
 
     def run(self):
         try:
@@ -293,8 +292,11 @@ class ClassifierTrainingThread(QThread):
             model = SpeciesClassifier(
                 num_species=num_species,
                 freeze_backbone=self.freeze_backbone,
+                backbone_name=self.backbone_name,
             )
             model = model.to(device)
+            model.idx_to_name = train_dataset.idx_to_name
+            model.name_to_idx = train_dataset.name_to_idx
 
             # ----------------------------------------------------------------
             # Loss, Optimizer, Scheduler
@@ -448,6 +450,7 @@ class ClassifierTrainingThread(QThread):
                 conn.execute('''CREATE TABLE IF NOT EXISTS classifier_metrics (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     model_name TEXT,
+                    backbone_name TEXT,
                     num_species INTEGER,
                     epochs INTEGER,
                     batch_size INTEGER,
@@ -459,10 +462,10 @@ class ClassifierTrainingThread(QThread):
                 )''')
                 conn.execute(
                     "INSERT INTO classifier_metrics "
-                    "(model_name, num_species, epochs, batch_size, learning_rate, "
+                    "(model_name, backbone_name, num_species, epochs, batch_size, learning_rate, "
                     " freeze_backbone, best_val_acc, best_epoch, timestamp) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    ("ResNet18", num_species, self.epochs, self.batch_size,
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (self.backbone_name, self.backbone_name, num_species, self.epochs, self.batch_size,
                      self.lr, int(self.freeze_backbone), best_val_acc, best_epoch,
                      datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                 )
@@ -504,25 +507,17 @@ class ClassifierTrainingTab(QWidget):
 
     def _auto_generate_save_name(self):
         """Generate a save name with consistent convention:
-        {epochs}e_{backbone}_classifier_{batch}batch_{id}.pth
-        Auto-increments the {id} based on existing files.
+        {epochs}e_{backbone}_classifier_{batch}batch_{freeze_status}_{month}_{day}.pth
+        Includes frozen/unfrozen status and creation date.
         """
         epochs = self.epoch_spinbox.value()
         batch  = self.batch_spinbox.value()
-        backbone = "resnet18"
-        base = f"{epochs}e_{backbone}_classifier_{batch}batch"
+        backbone = self.backbone_selector.currentText() if hasattr(self, 'backbone_selector') else "resnet18"
+        freeze_str = "frozen" if self.freeze_checkbox.isChecked() else "unfrozen"
+        now = datetime.now()
+        date_str = f"{now.day}_{now.month}"
 
-        # Find the next available ID
-        existing = [f for f in os.listdir('.') if f.endswith('.pth') and CLASSIFIER_PTH_PATTERN in f.lower()]
-        max_id = 0
-        for f in existing:
-            # Match pattern like "30e_resnet18_classifier_32batch_1.pth"
-            m = re.search(rf'{re.escape(base)}_(\d+)\.pth', f)
-            if m:
-                max_id = max(max_id, int(m.group(1)))
-        next_id = max_id + 1
-
-        return f"{base}_{next_id}.pth"
+        return f"{epochs}e_{backbone}_classifier_{batch}batch_{freeze_str}_{date_str}.pth"
 
     def _update_save_name(self):
         """Auto-update the save name input when epochs/batch change."""
@@ -541,11 +536,19 @@ class ClassifierTrainingTab(QWidget):
         base_group.setStyleSheet(_GRP)
         base_layout = QHBoxLayout()
 
-        # Model label (fixed: ResNet18)
-        base_layout.addWidget(QLabel("Model:"))
-        model_label = QLabel("ResNet18 (Pretrained)")
-        model_label.setStyleSheet("font-weight: bold; color: #2980b9;")
-        base_layout.addWidget(model_label)
+        # Backbone selector
+        base_layout.addWidget(QLabel("Backbone:"))
+        self.backbone_selector = QComboBox()
+        for bk in sorted(VALID_BACKBONES):
+            self.backbone_selector.addItem(bk)
+        self.backbone_selector.setCurrentText("resnet18")
+        self.backbone_selector.setToolTip(
+            "resnet18: 11.2M params, fastest\n"
+            "resnet50: 25.5M params, deeper CNN\n"
+            "swin_t: 28.3M params, transformer (same family as SwinIR restoration)"
+        )
+        self.backbone_selector.currentTextChanged.connect(self._update_save_name)
+        base_layout.addWidget(self.backbone_selector)
         base_layout.addSpacing(10)
 
         base_layout.addWidget(QLabel("Epochs:"))
@@ -705,6 +708,7 @@ class ClassifierTrainingTab(QWidget):
         self.mode_group.idToggled.connect(self.on_mode_changed)
         self.accum_spinbox.valueChanged.connect(self.on_accum_changed)
         self.batch_spinbox.valueChanged.connect(self.on_accum_changed)
+        self.freeze_checkbox.stateChanged.connect(self._update_save_name)
         self.epoch_spinbox.valueChanged.connect(self._update_save_name)
         self.batch_spinbox.valueChanged.connect(self._update_save_name)
 
@@ -788,6 +792,7 @@ class ClassifierTrainingTab(QWidget):
             use_amp         = use_amp,
             accum_steps     = accum,
             freeze_backbone = self.freeze_checkbox.isChecked(),
+            backbone_name   = self.backbone_selector.currentText(),
         )
         self.thread.log_signal.connect(self.update_console)
         self.thread.progress_signal.connect(self.progress_bar.setValue)

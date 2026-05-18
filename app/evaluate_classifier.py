@@ -1,14 +1,15 @@
 # app/evaluate_classifier.py
 #
 # Standalone evaluation script for the Species Classifier.
-# Loads trained weights, runs on the holdout test set, and generates:
+# Loads trained weights, runs on the holdout validation set, and generates:
 #   - Per-species precision, recall, F1-score
 #   - Confusion matrix (saved as PNG)
 #   - Accuracy bar chart
 #   - Console report
 #
 # Usage:
-#   python app/evaluate_classifier.py --weights classifier_weights.pth
+#   python app/evaluate_classifier.py --weights 30e_resnet18_unfrozen_32batch_0.0001.pth
+#   python app/evaluate_classifier.py --weights 30e_swin_t_unfrozen_32batch_0.0001.pth --backbone swin_t
 
 import os
 import sys
@@ -23,7 +24,7 @@ import torch
 
 # Add parent to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from app.classifier import create_classifier
+from app.classifier import create_classifier, detect_backbone_from_weights, VALID_BACKBONES
 from app.train_classifier import WoodClassificationDataset
 
 try:
@@ -33,14 +34,14 @@ try:
     MATPLOTLIB_AVAILABLE = True
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
-    print("⚠️ matplotlib not installed. Charts will be skipped.")
+    print("\u26a0\ufe0f matplotlib not installed. Charts will be skipped.")
 
 try:
     from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
-    print("⚠️ scikit-learn not installed. Install with: pip install scikit-learn")
+    print("\u26a0\ufe0f scikit-learn not installed. Install with: pip install scikit-learn")
 
 
 # ---------------------------------------------------------------------------
@@ -49,18 +50,27 @@ except ImportError:
 
 def evaluate(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🚀 Evaluating on device: {device}")
+    print(f"\U0001f680 Evaluating on device: {device}")
     print(f"{'='*60}")
 
     # Load classifier
     if not os.path.exists(args.weights):
-        print(f"❌ Weights not found: {args.weights}")
+        print(f"\u274c Weights not found: {args.weights}")
         return
 
-    classifier = create_classifier(weights_path=args.weights)
+    # Auto-detect backbone if not specified
+    backbone_name = args.backbone
+    if backbone_name is None:
+        backbone_name = detect_backbone_from_weights(args.weights)
+        print(f"\U0001f50d Auto-detected backbone: {backbone_name}")
+
+    classifier = create_classifier(
+        weights_path=args.weights,
+        backbone_name=backbone_name,
+    )
     classifier = classifier.to(device)
     classifier.eval()
-    print(f"✅ Classifier loaded: {classifier.num_species} species")
+    print(f"\u2705 Classifier loaded: {classifier.backbone_name}, {classifier.num_species} species")
 
     # Load validation dataset
     val_dataset = WoodClassificationDataset(
@@ -71,7 +81,7 @@ def evaluate(args):
         seed=42,
         augment=False,
     )
-    print(f"📊 Validation samples: {len(val_dataset)}")
+    print(f"\U0001f4ca Validation samples: {len(val_dataset)}")
 
     # Run inference on all validation samples
     all_preds = []
@@ -96,11 +106,11 @@ def evaluate(args):
             if (i + 1) % 100 == 0:
                 print(f"  Evaluated {i+1}/{len(val_dataset)}...")
 
-    # ── Metrics ───────────────────────────────────────────────────────────
+    # \u2014\u2014 Metrics \u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014
 
     accuracy = accuracy_score(all_labels, all_preds)
     print(f"\n{'='*60}")
-    print(f"📈 OVERALL ACCURACY: {accuracy:.2%}")
+    print(f"\U0001f4c8 OVERALL ACCURACY: {accuracy:.2%}")
     print(f"{'='*60}")
 
     # Per-species report
@@ -110,20 +120,23 @@ def evaluate(args):
         target_names=target_names,
         digits=4,
     )
-    print("\n📋 Per-Species Classification Report:")
+    print("\n\U0001f4cb Per-Species Classification Report:")
     print(report)
 
     # Save report to file
     os.makedirs("reports", exist_ok=True)
-    report_path = f"reports/classification_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    backbone_tag = classifier.backbone_name
+    report_path = f"reports/classification_report_{backbone_tag}_{timestamp}.txt"
     with open(report_path, 'w') as f:
         f.write(f"Classification Report\n")
         f.write(f"Weights: {args.weights}\n")
+        f.write(f"Backbone: {backbone_tag}\n")
         f.write(f"Accuracy: {accuracy:.2%}\n\n")
         f.write(report)
-    print(f"💾 Report saved to: {report_path}")
+    print(f"\U0001f4be Report saved to: {report_path}")
 
-    # ── Confusion Matrix ──────────────────────────────────────────────────
+    # \u2014\u2014 Confusion Matrix \u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014
 
     if MATPLOTLIB_AVAILABLE:
         cm = confusion_matrix(all_labels, all_preds)
@@ -149,17 +162,17 @@ def evaluate(args):
         ax.set_yticklabels(target_names, fontsize=8)
         ax.set_xlabel('Predicted', fontsize=12)
         ax.set_ylabel('Actual', fontsize=12)
-        ax.set_title(f'Confusion Matrix (Accuracy: {accuracy:.2%})', fontsize=14)
+        ax.set_title(f'Confusion Matrix ({backbone_tag}) \u2014 Accuracy: {accuracy:.2%}', fontsize=14)
 
         fig.colorbar(im, ax=ax, shrink=0.8)
         fig.tight_layout()
 
-        cm_path = f"reports/confusion_matrix_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        cm_path = f"reports/confusion_matrix_{backbone_tag}_{timestamp}.png"
         fig.savefig(cm_path, dpi=150)
         plt.close(fig)
-        print(f"💾 Confusion matrix saved to: {cm_path}")
+        print(f"\U0001f4be Confusion matrix saved to: {cm_path}")
 
-        # ── Accuracy Bar Chart ────────────────────────────────────────────
+        # \u2014\u2014 Accuracy Bar Chart \u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014
 
         per_species_acc = cm_norm.diagonal()
         fig2, ax2 = plt.subplots(figsize=(12, 6))
@@ -169,7 +182,7 @@ def evaluate(args):
         ax2.set_xticks(range(num_species))
         ax2.set_xticklabels(target_names, rotation=45, ha='right', fontsize=9)
         ax2.set_ylabel('Accuracy', fontsize=12)
-        ax2.set_title('Per-Species Classification Accuracy', fontsize=14)
+        ax2.set_title(f'Per-Species Classification Accuracy ({backbone_tag})', fontsize=14)
         ax2.set_ylim(0, 1.05)
         ax2.axhline(y=0.8, color='green', linestyle='--', alpha=0.5, label='80% target')
         ax2.legend()
@@ -180,13 +193,13 @@ def evaluate(args):
                      f'{acc:.1%}', ha='center', va='bottom', fontsize=7)
 
         fig2.tight_layout()
-        chart_path = f"reports/per_species_accuracy_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        chart_path = f"reports/per_species_accuracy_{backbone_tag}_{timestamp}.png"
         fig2.savefig(chart_path, dpi=150)
         plt.close(fig2)
-        print(f"💾 Accuracy chart saved to: {chart_path}")
+        print(f"\U0001f4be Accuracy chart saved to: {chart_path}")
 
     print(f"\n{'='*60}")
-    print(f"✅ Evaluation complete!")
+    print(f"\u2705 Evaluation complete!")
     print(f"{'='*60}")
 
 
@@ -200,12 +213,15 @@ def main():
     )
     parser.add_argument("--weights", "-w", type=str, default="classifier_weights.pth",
                         help="Path to trained classifier weights (default: classifier_weights.pth)")
+    parser.add_argument("--backbone", type=str, default=None,
+                        choices=sorted(VALID_BACKBONES) + [None],
+                        help=f"Backbone architecture (default: auto-detect from weights)")
     parser.add_argument("--val_ratio", "-v", type=float, default=0.2,
                         help="Validation split ratio (must match training, default: 0.2)")
     args = parser.parse_args()
 
     if not SKLEARN_AVAILABLE:
-        print("❌ scikit-learn is required for evaluation metrics.")
+        print("\u274c scikit-learn is required for evaluation metrics.")
         print("   Install: pip install scikit-learn")
         return
 
