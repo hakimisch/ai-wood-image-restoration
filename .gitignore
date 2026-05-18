@@ -10,6 +10,7 @@ venv/
 
 # Execution plans
 plans/
+.hermes.md
 
 # Virtual Environments
 torch_env/
