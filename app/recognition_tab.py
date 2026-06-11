@@ -476,8 +476,9 @@ class RecognitionTab(QWidget):
         if not self.live_mode:
             return
 
-        # Display the frame
-        pix = self._convert_cv_to_qpixmap(frame, self.live_feed.width(), self.live_feed.height())
+        # Display the frame — apply grayscale conversion for visual feedback
+        pix = self._convert_cv_to_qpixmap(frame, self.live_feed.width(), self.live_feed.height(),
+                                           is_gray=self.use_grayscale)
         self.live_feed.setPixmap(pix)
 
         # Auto-classify if enabled
@@ -610,7 +611,9 @@ class RecognitionTab(QWidget):
         else:
             self.load_classifier()
 
-    def _convert_cv_to_qpixmap(self, frame, label_width, label_height):
+    def _convert_cv_to_qpixmap(self, frame, label_width, label_height, is_gray=False):
+        if is_gray and len(frame.shape) == 3:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if len(frame.shape) == 2:
             h, w = frame.shape
             q_img = QImage(frame.data, w, h, w, QImage.Format.Format_Grayscale8)

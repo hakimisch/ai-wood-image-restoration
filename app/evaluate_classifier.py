@@ -118,7 +118,9 @@ def evaluate(args):
     report = classification_report(
         all_labels, all_preds,
         target_names=target_names,
+        labels=list(range(classifier.num_species)),
         digits=4,
+        zero_division=0,
     )
     print("\n\U0001f4cb Per-Species Classification Report:")
     print(report)
@@ -139,7 +141,7 @@ def evaluate(args):
     # \u2014\u2014 Confusion Matrix \u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014
 
     if MATPLOTLIB_AVAILABLE:
-        cm = confusion_matrix(all_labels, all_preds)
+        cm = confusion_matrix(all_labels, all_preds, labels=list(range(classifier.num_species)))
 
         # Normalize
         cm_norm = cm.astype('float') / (cm.sum(axis=1, keepdims=True) + 1e-10)
