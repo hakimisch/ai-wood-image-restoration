@@ -1,0 +1,8 @@
+input_type,overall_acc,correct,total
+blurred,0.182413,251,1376
+clear,0.686773,945,1376
+restored-Real-ESRGAN,0.037791,52,1376
+restored-SRCNN,0.107558,148,1376
+restored-SimpleCNN,0.096657,133,1376
+restored-SwinIR,0.063953,88,1376
+restored-VDSR,0.140988,194,1376

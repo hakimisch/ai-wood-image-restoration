@@ -1,0 +1,4 @@
+restore_model,restore_weights,classifier_backbone,classifier_weights_file,classifier_frozen,input_type,overall_acc,mean_confidence,correct,total,timestamp
+SRCNN,50e_srcnn_hybrid_accum2_4_10.pth,resnet18,1-50e_resnet18_classifier_32batch_unfrozen_10_6.pth,unfrozen,blurred,0.280523,0.812426,386,1376,2026-06-18 14:30:37
+SRCNN,50e_srcnn_hybrid_accum2_4_10.pth,resnet18,1-50e_resnet18_classifier_32batch_unfrozen_10_6.pth,unfrozen,restored,0.085029,0.661147,117,1376,2026-06-18 14:30:37
+SRCNN,50e_srcnn_hybrid_accum2_4_10.pth,resnet18,1-50e_resnet18_classifier_32batch_unfrozen_10_6.pth,unfrozen,clear,0.970930,0.985801,1336,1376,2026-06-18 14:30:37
